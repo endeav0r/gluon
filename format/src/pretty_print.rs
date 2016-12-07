@@ -433,10 +433,9 @@ impl<'a: 'e, 'e> Printer<'a, 'e> {
                         |spanned| spanned.value,
                     ))
                     .nest(INDENT)
-                    .append(self.whitespace(
-                        Span::new(last_field_end, expr.span.end),
-                        line.clone(),
-                    ))
+                    .append(
+                        self.whitespace(Span::new(last_field_end, expr.span.end), line.clone()),
+                    )
                     .group()
                     .append("}");
                 (arena.text("{"), record)
