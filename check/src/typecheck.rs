@@ -372,13 +372,11 @@ impl<'a> Typecheck<'a> {
     fn stack_type(&mut self, id: Symbol, alias: &Alias<Symbol, ArcType>) {
         // Insert variant constructors into the local scope
         let aliased_type = alias.typ();
-        if let Type::Forall(_, ref typ) = **aliased_type {
-            if let Type::Variant(ref row) = **typ {
-                for field in row.row_iter().cloned() {
-                    let symbol = self.symbols.symbol(field.name.as_ref());
-                    self.original_symbols.insert(symbol, field.name.clone());
-                    self.stack_var(field.name, field.typ);
-                }
+        if let Type::Variant(ref row) = **aliased_type.remove_forall() {
+            for field in row.row_iter().cloned() {
+                let symbol = self.symbols.symbol(field.name.as_ref());
+                self.original_symbols.insert(symbol, field.name.clone());
+                self.stack_var(field.name, field.typ);
             }
         }
         let generic_args = alias.params().iter().cloned().map(Type::generic).collect();

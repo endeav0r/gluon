@@ -968,6 +968,13 @@ impl<Id> ArcType<Id> {
         Arc::strong_count(&typ.typ)
     }
 
+    pub fn remove_forall(&self) -> &ArcType<Id> {
+        match **self {
+            Type::Forall(_, ref typ) => typ,
+            _ => self,
+        }
+    }
+
     pub fn pretty<'a>(&'a self, arena: &'a Arena<'a>) -> DocBuilder<'a, Arena<'a>>
     where
         Id: AsRef<str>,
@@ -1044,7 +1051,7 @@ impl ArcType {
             },
         }
 
-        Some(walk_move_type(typ, &mut |typ| {
+        Some(walk_move_type(typ.remove_forall().clone(), &mut |typ| {
             match **typ {
                 Type::Generic(ref generic) => {
                     // Replace the generic variable with the type from the list
