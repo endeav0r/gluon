@@ -43,9 +43,10 @@ fn find_kind(args: WithVM<RootStr>) -> IO<Result<String, String>> {
     let args = args.value.trim();
     IO::Value(match vm.find_type_info(args) {
         Ok(ref alias) => {
-            let kind = alias.args.iter().rev().fold(Kind::typ(), |acc, arg| {
-                Kind::function(arg.kind.clone(), acc)
-            });
+            let kind = alias.params().iter().rev().fold(
+                Kind::typ(),
+                |acc, arg| Kind::function(arg.kind.clone(), acc),
+            );
             Ok(format!("{}", kind))
         }
         Err(err) => Err(format!("{}", err)),
@@ -63,7 +64,7 @@ fn find_info(args: WithVM<RootStr>) -> IO<Result<String, String>> {
             // Found a type alias
             let mut fmt = || -> Result<(), ::std::fmt::Error> {
                 write!(&mut buffer, "type {}", args)?;
-                for g in &alias.args {
+                for g in alias.params() {
                     write!(&mut buffer, " {}", g.id)?;
                 }
                 write!(&mut buffer, " = {}", alias.unresolved_type())
