@@ -1397,6 +1397,18 @@ impl<'a> Typecheck<'a> {
                         )
                     })
                     .collect();
+                let result = Type::forall(
+                    constraints
+                        .iter()
+                        .map(|constraint| {
+                            Generic::new(
+                                constraint.0.clone(),
+                                constraint.1[0].kind().into_owned()
+                            )
+                        })
+                        .collect(),
+                    result
+                );
                 debug!(
                     "Intersect result {}\n\t{}",
                     result,
