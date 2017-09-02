@@ -318,8 +318,7 @@ impl<'a> Typecheck<'a> {
                 let typ = self.subs.set_type(typ);
 
                 self.named_variables.clear();
-                let typ =
-                    new_skolem_scope(&mut self.named_variables, &self.subs, &constraints, &typ);
+                let typ = new_skolem_scope(&self.subs, &constraints, &typ);
 
                 debug!("Find {} : {}", self.symbols.string(id), typ);
                 Ok(typ)
@@ -897,12 +896,7 @@ impl<'a> Typecheck<'a> {
                     }
                 };
                 let id_type = self.instantiate(&id_type);
-                let record_type = new_skolem_scope(
-                    &mut self.named_variables,
-                    &self.subs,
-                    &FnvMap::default(),
-                    &record_type,
-                );
+                let record_type = new_skolem_scope(&self.subs, &FnvMap::default(), &record_type);
                 self.unify(&self.type_cache.record(new_types, new_fields), record_type)?;
                 *typ = id_type.clone();
                 Ok(TailCall::Type(id_type.clone()))
@@ -1021,12 +1015,7 @@ impl<'a> Typecheck<'a> {
                     }
                 };
                 typ = self.instantiate(&typ);
-                actual_type = new_skolem_scope(
-                    &mut self.named_variables,
-                    &self.subs,
-                    &FnvMap::default(),
-                    &actual_type,
-                );
+                actual_type = new_skolem_scope(&self.subs, &FnvMap::default(), &actual_type);
                 self.unify_span(span, &match_type, typ);
                 let match_type = actual_type;
 
@@ -1363,7 +1352,6 @@ impl<'a> Typecheck<'a> {
                     self.subs.real(&existing_binding.typ),
                     self.subs.real(symbol_type)
                 );
-                let level = self.subs.var_id();
                 let (intersection_constraints, mut result) = {
                     let state = unify_type::State::new(&self.environment, &self.subs);
                     unify::intersection(
@@ -1783,8 +1771,7 @@ impl<'a> Typecheck<'a> {
         constraints: &FnvMap<Symbol, Constraints<ArcType>>,
         typ: &ArcType,
     ) -> ArcType {
-        self.named_variables.clear();
-        new_skolem_scope(&mut self.named_variables, &self.subs, constraints, typ)
+        new_skolem_scope(&self.subs, constraints, typ)
     }
 
     fn error_on_duplicated_field(
