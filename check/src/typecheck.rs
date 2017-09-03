@@ -1559,6 +1559,7 @@ impl<'a> Typecheck<'a> {
                         Type::Generic(ref generic)
                             if self.type_variables.get(&generic.id).is_none() =>
                         {
+                            println!("xy {:?}", self.type_variables);
                             self.type_variables.insert(generic.id.clone(), typ.clone());
                         }
                         _ => (),
@@ -1575,12 +1576,15 @@ impl<'a> Typecheck<'a> {
     fn instantiate_signature(&mut self, typ: &ArcType) -> ArcType {
         let typ = self.instantiate(typ);
         // Put all new generic variable names into scope
-        for (generic, variable) in &self.named_variables {
-            if self.type_variables.get(generic).is_none() {
-                self.type_variables
-                    .insert(generic.clone(), variable.clone());
-            }
+        if let Type::Forall(ref params, _, Some(ref vars)) = *typ {
+            self.type_variables.extend(
+                params
+                    .iter()
+                    .zip(vars)
+                    .map(|(param, var)| (param.id.clone(), var.clone())),
+            );
         }
+        println!("aa {:?}", self.type_variables);
         typ
     }
 
@@ -1667,6 +1671,7 @@ impl<'a> Typecheck<'a> {
                         })
                     }
                     Type::Forall(ref params, ref typ, _) => {
+                        println!("{:?}", self.type_variables);
                         for param in params {
                             self.type_variables.insert(param.id.clone(), typ.clone());
                         }
@@ -1681,6 +1686,7 @@ impl<'a> Typecheck<'a> {
                     Type::Generic(ref generic)
                         if self.type_variables.get(&generic.id).is_none() =>
                     {
+                        println!("xx {:?}", self.type_variables);
                         self.type_variables.insert(generic.id.clone(), typ.clone());
                         None
                     }

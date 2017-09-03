@@ -811,7 +811,7 @@ pub fn merge_signature(
     variables: &mut ScopedMap<Symbol, ArcType>,
     level: u32,
     state: State,
-    mut l: &ArcType,
+    l: &ArcType,
     r: &ArcType,
 ) -> Result<ArcType, Errors<Error<Symbol>>> {
     let mut unifier = UnifierState {
@@ -823,17 +823,6 @@ pub fn merge_signature(
             level: level,
         },
     };
-
-    // Bring the variables into scope so that the unbound variables on the right hand side
-    // gets named the same as the left hand side
-    if let Type::Forall(ref params, ref l_inner, _) = **l {
-        unifier.unifier.variables.extend(
-            params
-                .iter()
-                .map(|param| (param.id.clone(), Type::generic(param.clone()))),
-        );
-        l = l_inner;
-    }
 
     let typ = unifier.try_match(l, r);
     if unifier.unifier.errors.has_errors() {
@@ -873,6 +862,7 @@ impl<'a, 'e> Unifier<State<'a>, ArcType> for Merge<'e> {
             (&Type::Hole, _) => Ok(None),
             (&Type::Variable(ref l), &Type::Variable(ref r)) if l.id == r.id => Ok(None),
             (&Type::Generic(ref l_gen), &Type::Variable(ref r_var)) => {
+                println!("123 {:?}", unifier.unifier.variables);
                 let left = match unifier.unifier.variables.get(&l_gen.id) {
                     Some(generic_bound_var) => {
                         match **generic_bound_var {
@@ -902,7 +892,7 @@ impl<'a, 'e> Unifier<State<'a>, ArcType> for Merge<'e> {
             // ```gluon
             // let make_Category cat : Category cat -> _ =
             //     let { id, compose } = cat
-            // 
+            //
             //     let (<<): forall a b c . cat b c -> cat a b -> cat a c = compose
             //     // If we didn't add a new skolem scope before inserting the union the user of
             //     // `compose` here would unify `Forall(params, .., None)` with the `forall` from
