@@ -858,6 +858,7 @@ impl<'a, 'e> Unifier<State<'a>, ArcType> for Merge<'e> {
         let r = subs.real(r);
         // `l` and `r` must have the same type, if one is a variable that variable is
         // unified with whatever the other type is
+        debug!("{:?} ,,, {:?}", l, r);
         match (&**l, &**r) {
             (&Type::Hole, _) => Ok(None),
             (&Type::Variable(ref l), &Type::Variable(ref r)) if l.id == r.id => Ok(None),
@@ -901,10 +902,9 @@ impl<'a, 'e> Unifier<State<'a>, ArcType> for Merge<'e> {
             //     // `Typecheck::find`
             //     { id, compose, (<<) }
             // ```
-            (&Type::Forall(_, _, None), &Type::Variable(ref r)) => {
+            (&Type::Forall(_, _, None), _) => {
                 let l = new_skolem_scope(subs, &FnvMap::default(), l);
-                subs.union(|| unifier.state.fresh(), r, &l)?;
-                Ok(None)
+                unifier.try_match_res(&l, r)
             }
             (_, &Type::Variable(ref r)) => {
                 subs.union(|| unifier.state.fresh(), r, l)?;

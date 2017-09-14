@@ -1337,20 +1337,35 @@ impl<'a> Typecheck<'a> {
     }
 
     fn intersect_type(&mut self, level: u32, symbol: &Symbol, symbol_type: &ArcType) {
-        let mut typ;
+        fn no_type_variables(typ: &ArcType) -> bool {
+            let mut no_variables = true;
+            types::visit_type_opt(typ, &mut |typ: &ArcType| {
+                if let Type::Variable(_) = **typ {
+                    no_variables = false;
+                }
+                None
+            });
+            no_variables
+        }
+        let typ;
         let mut constraints = FnvMap::default();
+        let mut symbol_type = symbol_type.clone();
+        self.generalize_type(level, &mut symbol_type);
         {
             let existing_types = self.environment
                 .stack
                 .get_all(symbol)
                 .expect("Symbol is not in scope");
-            if existing_types.len() >= 2 {
+            // Only allow overloading for bindings whose types which do not contain type variables
+            // It might be possible to lift this restriction but currently it causes problems
+            // which I am not sure how to solve
+            if existing_types.len() >= 2 && no_type_variables(&symbol_type) {
                 let existing_binding = &existing_types[existing_types.len() - 2];
                 debug!(
                     "Intersect `{}`\n{} ∩ {}",
                     symbol,
                     self.subs.real(&existing_binding.typ),
-                    self.subs.real(symbol_type)
+                    self.subs.real(&symbol_type)
                 );
                 let existing_type = new_skolem_scope(
                     &self.subs,
@@ -1423,7 +1438,6 @@ impl<'a> Typecheck<'a> {
                 typ = symbol_type.clone()
             }
         }
-        self.generalize_type(level, &mut typ);
         let bind = self.environment.stack.get_mut(symbol).unwrap();
         bind.constraints = constraints;
         bind.typ = typ;
