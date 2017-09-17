@@ -231,7 +231,6 @@ impl<'de, 't> Deserializer<'de, 't> {
         T: Getable<'de>,
     {
         let typ = resolve::remove_aliases_cow(self.state.env, self.typ);
-        println!("{}   {:?}", typ, typ);
         match T::from_value(self.state.thread, self.input) {
             Some(c) => if expected(&typ) {
                 visit(c)

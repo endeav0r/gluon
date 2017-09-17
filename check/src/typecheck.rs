@@ -26,7 +26,7 @@ use kindcheck::{self, Error as KindCheckError, KindCheck, KindError};
 use substitution::{self, Constraints, Substitution};
 use rename::RenameError;
 use unify::{self, Error as UnifyError};
-use unify_type::{self, new_skolem_scope, skolemize, Error as UnifyTypeError};
+use unify_type::{self, new_skolem_scope, Error as UnifyTypeError};
 
 /// Type representing a single error when checking a type
 #[derive(Debug, PartialEq)]
@@ -667,6 +667,7 @@ impl<'a> Typecheck<'a> {
                 for arg in args.iter_mut() {
                     let f = self.type_cache
                         .function(once(self.subs.new_var()), self.subs.new_var());
+                    func_type = self.instantiate_generics(&func_type);
                     func_type = self.unify(&f, func_type)?;
                     func_type = match func_type.as_function() {
                         Some((arg_ty, ret_ty)) => {
@@ -722,6 +723,9 @@ impl<'a> Typecheck<'a> {
                         }
                         _ => {
                             op.value.typ = self.find(&op.value.name)?;
+                            println!("{}", op.value.typ);
+                            op.value.typ = self.instantiate_generics(&op.value.typ);
+                            println!("{}", op.value.typ);
                             let func_type = self.type_cache
                                 .function(vec![lhs_type, rhs_type], self.subs.new_var());
                             let ret = self.unify(&op.value.typ, func_type)?
@@ -803,7 +807,7 @@ impl<'a> Typecheck<'a> {
                         expr_typ = self.unify(&record_type, expr_typ)?;
                     }
                 }
-                expr_typ = self.skolemize(&expr_typ);
+                expr_typ = self.instantiate_generics(&expr_typ);
                 let record = self.remove_aliases(expr_typ.clone());
                 match *record {
                     Type::Variable(_) | Type::Record(_) => {
@@ -1094,7 +1098,7 @@ impl<'a> Typecheck<'a> {
         let len = args.len();
         match args.split_first_mut() {
             Some((head, tail)) => {
-                let typ = self.skolemize(&typ);
+                let typ = self.instantiate_generics(&typ);
                 match typ.as_function() {
                     Some((arg, ret)) => {
                         self.typecheck_pattern(head, arg.clone());
@@ -1573,7 +1577,6 @@ impl<'a> Typecheck<'a> {
                         Type::Generic(ref generic)
                             if self.type_variables.get(&generic.id).is_none() =>
                         {
-                            println!("xy {:?}", self.type_variables);
                             self.type_variables.insert(generic.id.clone(), typ.clone());
                         }
                         _ => (),
@@ -1598,7 +1601,6 @@ impl<'a> Typecheck<'a> {
                     .map(|(param, var)| (param.id.clone(), var.clone())),
             );
         }
-        println!("aa {:?}", self.type_variables);
         typ
     }
 
@@ -1685,7 +1687,6 @@ impl<'a> Typecheck<'a> {
                         })
                     }
                     Type::Forall(ref params, ref typ, _) => {
-                        println!("{:?}", self.type_variables);
                         for param in params {
                             self.type_variables.insert(param.id.clone(), typ.clone());
                         }
@@ -1700,7 +1701,6 @@ impl<'a> Typecheck<'a> {
                     Type::Generic(ref generic)
                         if self.type_variables.get(&generic.id).is_none() =>
                     {
-                        println!("xx {:?}", self.type_variables);
                         self.type_variables.insert(generic.id.clone(), typ.clone());
                         None
                     }
@@ -1796,7 +1796,12 @@ impl<'a> Typecheck<'a> {
 
     fn skolemize(&mut self, typ: &ArcType) -> ArcType {
         self.named_variables.clear();
-        skolemize(&mut self.named_variables, typ)
+        typ.skolemize(&mut self.named_variables)
+    }
+
+    fn instantiate_generics(&mut self, typ: &ArcType) -> ArcType {
+        self.named_variables.clear();
+        typ.instantiate_generics(&mut self.named_variables)
     }
 
     fn instantiate(&mut self, typ: &ArcType) -> ArcType {

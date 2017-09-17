@@ -535,9 +535,7 @@ impl<'a, 'e> Compiler<'a, 'e> {
                 return Ok(TailCall::Tail(body));
             }
             Expr::Call(f, args) => {
-                println!("{}", expr);
                 let f = self.compile(f, function)?.unwrap_or(Reduced::Local(f));
-                println!("xx {}", f.as_ref());
                 match *f.as_ref() {
                     Expr::Ident(ref id, ..) => {
                         if id.name.as_ref().starts_with("#") && args.len() == 2 {
@@ -571,7 +569,6 @@ impl<'a, 'e> Compiler<'a, 'e> {
                 let expr = self.compile(expr, function)?.unwrap_or(
                     Reduced::Local(expr),
                 );
-                println!("aaa {}\n", expr.as_ref());
                 for alt in alts {
                     self.stack_constructors.enter_scope();
                     function.stack.enter_scope();
@@ -670,7 +667,6 @@ impl<'a, 'e> Compiler<'a, 'e> {
                                 Expr::Ident(ref id, _) => self.load_identifier(&id.name, function)?,
                                 ref expr => wrap(expr).into(),
                             };
-                            println!("bind {} {:?}", field_name, expr);
                             function.push_stack_var(self, field_name, expr);
                         }
                     },
