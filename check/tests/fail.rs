@@ -167,7 +167,7 @@ in 1
 "#;
     let result = support::typecheck(text);
 
-    assert_err!(result, KindError(TypeMismatch(..)));
+    assert_err!(result, KindError(TypeMismatch(..), _));
 }
 
 #[test]
@@ -401,7 +401,7 @@ type Bar = Test Foo
 ()
 "#;
     let result = support::typecheck(text);
-    assert_err!(result, KindError(TypeMismatch(..)));
+    assert_err!(result, KindError(TypeMismatch(..), _));
 }
 
 #[test]
@@ -413,7 +413,7 @@ type Bar = Test Int
 ()
 "#;
     let result = support::typecheck(text);
-    assert_err!(result, KindError(TypeMismatch(..)));
+    assert_err!(result, KindError(TypeMismatch(..), _));
 }
 
 #[test]
@@ -425,7 +425,7 @@ type Foo = Test Int
 ()
 "#;
     let result = support::typecheck(text);
-    assert_err!(result, KindError(TypeMismatch(..)));
+    assert_err!(result, KindError(TypeMismatch(..), _));
 }
 
 #[test]
