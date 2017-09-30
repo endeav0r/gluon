@@ -64,7 +64,7 @@ pub enum TypeError<I> {
 
 impl<I> TypeError<I> {
     fn from_kind_error(e: KindCheckError<I>, typ: ArcType<I>) -> Self {
-           match e {
+        match e {
             UnifyError::Other(KindError::UndefinedType(name)) => TypeError::UndefinedType(name),
             e => TypeError::KindError(e, typ),
         }

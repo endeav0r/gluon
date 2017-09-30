@@ -365,45 +365,14 @@ where
         }
         (&Type::Alias(ref alias), &Type::Ident(ref id)) if *id == alias.name => Ok(None),
 
-        (
-            &Type::Forall(ref l_params, ref l, Some(ref l_skolem)),
-            &Type::Forall(ref r_params, ref r, Some(ref r_skolem)),
-        ) => {
-            let mut variables = FnvMap::default();
-
-            variables.extend(
-                l_params
-                    .iter()
-                    .zip(l_skolem)
-                    .map(|(param, var)| (param.id.clone(), var.clone())),
-            );
-            let l = l.skolemize(&mut variables);
-
-            variables.clear();
-            variables.extend(
-                r_params
-                    .iter()
-                    .zip(r_skolem)
-                    .map(|(param, var)| (param.id.clone(), var.clone())),
-            );
-            let r = r.skolemize(&mut variables);
-
-            l.zip_match(&r, unifier)
-        }
         (&Type::Forall(_, _, Some(_)), _) => {
             let l = expected.instantiate_generics(&mut FnvMap::default());
-            Ok(
-                unifier
-                    .try_match_res(&l, &actual)?
-            )
+            Ok(unifier.try_match_res(&l, &actual)?)
         }
 
         (_, &Type::Forall(_, _, Some(_))) => {
             let r = actual.instantiate_generics(&mut FnvMap::default());
-            Ok(
-                unifier
-                    .try_match_res(expected, &r)?
-            )
+            Ok(unifier.try_match_res(expected, &r)?)
         }
 
         (&Type::Skolem(ref l), &Type::Skolem(ref r)) if r.name == l.name => Ok(None),
@@ -887,7 +856,11 @@ impl<'a, 'e> Unifier<State<'a>, ArcType> for Merge<'e> {
             //     { id, compose, (<<) }
             // ```
             (&Type::Forall(ref params, ref l, None), _) => {
-                unifier.unifier.variables.extend(params.iter().map(|param| (param.id.clone(), subs.new_var())));
+                unifier.unifier.variables.extend(
+                    params
+                        .iter()
+                        .map(|param| (param.id.clone(), subs.new_var())),
+                );
                 unifier.try_match_res(&l, r)
             }
             (_, &Type::Variable(ref r)) => {

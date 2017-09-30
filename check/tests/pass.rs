@@ -1134,3 +1134,27 @@ make_Category category_Function
 
     assert!(result.is_ok(), "{}", result.unwrap_err());
 }
+
+#[test]
+fn functor_function() {
+    let _ = ::env_logger::init();
+
+    let text = r#"
+type Category (cat : Type -> Type -> Type) = { id : cat a a, compose : cat b c -> cat a b -> cat a c }
+
+let category_Function : Category (->) = {
+    id = \x -> x,
+    compose = \f g x -> f (g x)
+}
+
+type Functor f = {
+    map : (a -> b) -> f a -> f b
+}
+
+let functor_Function : Functor ((->) a) = { map = category_Function.compose }
+0
+"#;
+    let result = support::typecheck(text);
+
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+}
