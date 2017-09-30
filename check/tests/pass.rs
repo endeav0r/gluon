@@ -1147,12 +1147,44 @@ let category_Function : Category (->) = {
     compose = \f g x -> f (g x)
 }
 
+let id : a -> a = category_Function.id
+
 type Functor f = {
-    map : (a -> b) -> f a -> f b
+    map : forall a b . (a -> b) -> f a -> f b
 }
 
 let functor_Function : Functor ((->) a) = { map = category_Function.compose }
 0
+"#;
+    let result = support::typecheck(text);
+
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+}
+
+#[test]
+fn make_applicative_bug_type_holes() {
+    let _ = ::env_logger::init();
+
+    let text = r#"
+type Applicative f = {
+    map : forall a b . (a -> b) -> f a -> f b,
+    apply : forall c d . f (c -> d) -> f c -> f d
+}
+
+let id : forall a. a -> a = \x -> x
+
+let const : forall a b. a -> b -> a = \x _ -> x
+
+let make_applicative app =
+    let { map, apply } = app
+
+    let (<*>) : _ (a -> b) -> _ a -> _ b = apply
+    let (<*) l r : _ a -> _ b -> _ a = map const l <*> r
+    let (*>) l r : _ a -> _ b -> _ b = map (const id) l <*> r
+
+    ()
+
+()
 "#;
     let result = support::typecheck(text);
 

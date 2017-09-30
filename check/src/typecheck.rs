@@ -680,11 +680,16 @@ impl<'a> Typecheck<'a> {
             })),
             Expr::App(ref mut func, ref mut args) => {
                 let mut func_type = self.infer_expr(&mut **func);
+                debug!(":::: {}", func_type);
+                debug!(":::: {:?}", func_type);
                 for arg in args.iter_mut() {
                     let f = self.type_cache
                         .function(once(self.subs.new_var()), self.subs.new_var());
+                    debug!("1----- {}", func_type);
                     func_type = self.instantiate_generics(&func_type);
+                    debug!("2----- {}", func_type);
                     func_type = self.unify(&f, func_type)?;
+                    debug!("------ {}", func_type);
                     func_type = match func_type.as_function() {
                         Some((arg_ty, ret_ty)) => {
                             let actual = self.typecheck(arg, arg_ty);
@@ -1189,8 +1194,9 @@ impl<'a> Typecheck<'a> {
             self.type_variables.exit_scope();
         }
         // Once all variables inside the let has been unified we can quantify them
-        debug!("Generalize {}", level);
+        debug!("Generalize at {}", level);
         for bind in bindings.iter_mut() {
+            debug!("Generalize {}", bind.resolved_type);
             self.generalize_binding(level, bind);
             self.finish_pattern(level, &mut bind.name, &bind.resolved_type);
         }
@@ -1532,7 +1538,6 @@ impl<'a> Typecheck<'a> {
         typ: &ArcType,
     ) -> Option<ArcType> {
         use base::types::TypeVisitor;
-
         let mut visitor = types::ControlVisitation(|typ: &ArcType| {
             let replacement = self.subs
                 .replace_variable(typ)
@@ -1543,7 +1548,8 @@ impl<'a> Typecheck<'a> {
                 typ = t;
             }
             match **typ {
-                Type::Variable(ref var) if self.subs.get_level(var.id) >= level => {
+                Type::Variable(ref var) if { self.subs.get_level(var.id) >= level } => {
+                    debug!("var {}", var.id);
                     if self.subs.get_constraints(var.id).is_some() {
                         let resolved_result = {
                             let state = unify_type::State::new(&self.environment, &self.subs);
@@ -1586,6 +1592,7 @@ impl<'a> Typecheck<'a> {
                         let gen: ArcType =
                             Type::generic(Generic::new(id.clone(), var.kind.clone()));
                         self.subs.insert(var.id, gen.clone());
+                        debug!("var replaced {}", gen);
                         Some(gen)
                     }
                 }

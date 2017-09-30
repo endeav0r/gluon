@@ -1490,17 +1490,20 @@ where
         let doc = match **typ {
             Type::Hole => arena.text("_"),
             Type::Opaque => arena.text("<opaque>"),
-            Type::Forall(ref args, ref typ, _) => chain![arena;
-                chain![arena;
-                    "forall ",
-                    arena.concat(args.iter().map(|arg| {
-                        arena.text(arg.id.as_ref()).append(arena.space())
-                    })),
-                    "."
-                ].group(),
-                arena.space(),
-                top(typ).pretty(printer)
-            ],
+            Type::Forall(ref args, ref typ, _) => {
+                let doc = chain![arena;
+                    chain![arena;
+                        "forall ",
+                        arena.concat(args.iter().map(|arg| {
+                            arena.text(arg.id.as_ref()).append(arena.space())
+                        })),
+                        "."
+                    ].group(),
+                    arena.space(),
+                    top(typ).pretty(printer)
+                ];
+                p.enclose(Prec::Constructor, arena, doc)
+            }
             Type::Variable(ref var) => arena.text(format!("{}", var.id)),
             Type::Skolem(ref skolem) => arena.text(skolem.name.as_ref()),
             Type::Generic(ref gen) => arena.text(gen.id.as_ref()),
