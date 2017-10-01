@@ -434,74 +434,11 @@ let make_Traversable traversable : Traversable t -> _ =
 
     { functor, foldable, traverse, sequence, for }
 
-{
-    Ordering,
+let x = {
 
-    Semigroup,
-    make_Semigroup,
-    semigroup_Function,
-    semigroup_Int_Add,
-    semigroup_Int_Mul,
-    semigroup_Float_Add,
-    semigroup_Float_Mul,
-    semigroup_Ordering,
-
-    Monoid,
-    monoid_Function,
-    monoid_Int_Add,
-    monoid_Int_Mul,
-    monoid_Float_Add,
-    monoid_Float_Mul,
-    monoid_Ordering,
-
-    Group,
-    group_Int_Add,
-    group_Float_Add,
-    group_Float_Mul,
-
-    Eq,
-    eq_Float,
-    eq_Int,
-
-    Ord,
-    make_Ord,
-    ord_Float,
-    ord_Int,
-
-    Category,
     make_Category,
-    category_Function,
 
     Functor,
-
-    Applicative,
-    make_Applicative,
-
-    Alternative,
-    make_Alternative,
-
-    Monad,
-    make_Monad,
-
-    Foldable,
-    make_Foldable,
-
-    Traversable,
-    make_Traversable,
-
-    Num,
-    num_Int,
-    num_Float,
-
-    id,
-    const,
-    flip,
-    (<|),
-    (|>),
-    (<<),
-    (>>),
-
-    Show,
-    show_Int,
-    show_Float
 }
+let { Functor } = x
+x

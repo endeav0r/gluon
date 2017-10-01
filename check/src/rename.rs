@@ -423,6 +423,7 @@ impl<'a> Unifier<State<'a>, ArcType> for Equivalent {
         debug!("{} ====> {}", l, r);
         match (&**l, &**r) {
             (&Type::Generic(ref gl), &Type::Generic(ref gr)) if gl == gr => Ok(None),
+            (&Type::Skolem(ref gl), &Type::Skolem(ref gr)) if gl == gr => Ok(None),
             (&Type::Generic(ref gl), _) => match unifier.unifier.map.get(&gl.id).cloned() {
                 Some(ref typ) => unifier.try_match_res(typ, r),
                 None => {

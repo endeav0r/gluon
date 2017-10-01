@@ -432,7 +432,7 @@ let function_test: Test ((->) a) = {
 function_test.test
 ";
     let result = support::typecheck(text);
-    let expected = Ok("forall a . a -> Int".to_string());
+    let expected = Ok("a -> Int".to_string());
 
     assert_req!(result.map(|typ| typ.to_string()), expected);
 }
@@ -468,7 +468,7 @@ c
 ";
     let result = support::typecheck(text);
 
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "{}", result.unwrap_err());
 }
 
 #[test]
@@ -1140,7 +1140,10 @@ fn functor_function() {
     let _ = ::env_logger::init();
 
     let text = r#"
-type Category (cat : Type -> Type -> Type) = { id : cat a a, compose : cat b c -> cat a b -> cat a c }
+type Category (cat : Type -> Type -> Type) = {
+    id : cat a a,
+    compose : cat b c -> cat a b -> cat a c
+}
 
 let category_Function : Category (->) = {
     id = \x -> x,
@@ -1162,29 +1165,18 @@ let functor_Function : Functor ((->) a) = { map = category_Function.compose }
 }
 
 #[test]
-fn make_applicative_bug_type_holes() {
+fn type_field_and_make_function_do_not_introduce_forall() {
     let _ = ::env_logger::init();
 
     let text = r#"
-type Applicative f = {
-    map : forall a b . (a -> b) -> f a -> f b,
-    apply : forall c d . f (c -> d) -> f c -> f d
-}
+type Test a = { x : a }
+let id x : forall a . a -> a = x
+let make_Category id : (forall a . a -> a) -> _ =
 
-let id : forall a. a -> a = \x -> x
-
-let const : forall a b. a -> b -> a = \x _ -> x
-
-let make_applicative app =
-    let { map, apply } = app
-
-    let (<*>) : _ (a -> b) -> _ a -> _ b = apply
-    let (<*) l r : _ a -> _ b -> _ a = map const l <*> r
-    let (*>) l r : _ a -> _ b -> _ b = map (const id) l <*> r
-
-    ()
-
-()
+    { id, }
+let x = { Test, make_Category }
+let { Test } = x
+1
 "#;
     let result = support::typecheck(text);
 

@@ -3,7 +3,6 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
 
-use fnv::FnvMap;
 use pos::{self, BytePos, HasSpan, Span, Spanned};
 use symbol::Symbol;
 use types::{self, Alias, AliasData, ArcType, Type, TypeEnv};
