@@ -871,25 +871,34 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
                                 ref typ,
                                 ref fields,
                                 ..
-                            } => fields
-                                .iter()
-                                .map(|field| {
-                                    field.value.as_ref().map(Cow::Borrowed).unwrap_or_else(|| {
-                                        let field_type = remove_aliases_cow(&self.0.env, typ)
-                                            .row_iter()
-                                            .find(|f| f.name.name_eq(&field.name.value))
-                                            .map(|f| f.typ.clone())
-                                            .unwrap_or_else(|| Type::hole());
-                                        Cow::Owned(spanned(
-                                            Span::default(),
-                                            ast::Pattern::Ident(TypedIdent {
-                                                name: field.name.value.clone(),
-                                                typ: field_type,
-                                            }),
-                                        ))
+                            } => {
+                                let record_type = remove_aliases_cow(&self.0.env, typ);
+
+                                fields
+                                    .iter()
+                                    .map(|field| {
+                                        field.value.as_ref().map(Cow::Borrowed).unwrap_or_else(|| {
+                                            let field_type = record_type
+                                                .row_iter()
+                                                .find(|f| f.name.name_eq(&field.name.value))
+                                                .map(|f| f.typ.clone())
+                                                .unwrap_or_else(|| {
+                                                    panic!(
+                                                        "ICE: Expected record field, found `{}`",
+                                                        typ
+                                                    )
+                                                });
+                                            Cow::Owned(spanned(
+                                                Span::default(),
+                                                ast::Pattern::Ident(TypedIdent {
+                                                    name: field.name.value.clone(),
+                                                    typ: field_type,
+                                                }),
+                                            ))
+                                        })
                                     })
-                                })
-                                .collect::<Vec<_>>(),
+                                    .collect::<Vec<_>>()
+                            }
                             ast::Pattern::Tuple { ref elems, .. } => {
                                 elems.iter().map(Cow::Borrowed).collect::<Vec<_>>()
                             }
@@ -955,8 +964,8 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
                         ast::Pattern::Error => unreachable!(),
                     }
                 }
-                let complete = groups.len() ==
-                    remove_aliases_cow(&self.0.env, &variables[0].env_type_of(&self.0.env))
+                let complete = groups.len()
+                    == remove_aliases_cow(&self.0.env, &variables[0].env_type_of(&self.0.env))
                         .row_iter()
                         .count();
 
@@ -1228,7 +1237,7 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
                                 .row_iter()
                                 .find(|f| f.name.name_eq(&field.name.value))
                                 .map(|f| f.typ.clone())
-                                .unwrap_or_else(|| Type::hole());
+                                .unwrap_or_else(|| panic!("ICE: Expected record found `{}`", typ));
                             record_fields.push((
                                 TypedIdent {
                                     name: field.name.value.clone(),
@@ -1399,8 +1408,8 @@ mod tests {
                             &Pattern::Constructor(ref l, ref l_ids),
                             &Pattern::Constructor(ref r, ref r_ids),
                         ) => {
-                            check(map, &l.name, &r.name) &&
-                                l_ids
+                            check(map, &l.name, &r.name)
+                                && l_ids
                                     .iter()
                                     .zip(r_ids)
                                     .all(|(l, r)| check(map, &l.name, &r.name))
@@ -1435,12 +1444,12 @@ mod tests {
                 check(map, &lb.name.name, &rb.name.name) && b && expr_eq(map, l, r)
             }
             (&Expr::Call(lf, l_args), &Expr::Call(rf, r_args)) => {
-                expr_eq(map, lf, rf) && l_args.len() == r_args.len() &&
-                    l_args.iter().zip(r_args).all(|(l, r)| expr_eq(map, l, r))
+                expr_eq(map, lf, rf) && l_args.len() == r_args.len()
+                    && l_args.iter().zip(r_args).all(|(l, r)| expr_eq(map, l, r))
             }
             (&Expr::Data(ref l, l_args, ..), &Expr::Data(ref r, r_args, ..)) => {
-                check(map, &l.name, &r.name) && l_args.len() == r_args.len() &&
-                    l_args.iter().zip(r_args).all(|(l, r)| expr_eq(map, l, r))
+                check(map, &l.name, &r.name) && l_args.len() == r_args.len()
+                    && l_args.iter().zip(r_args).all(|(l, r)| expr_eq(map, l, r))
             }
             _ => false,
         }
