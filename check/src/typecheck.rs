@@ -636,7 +636,8 @@ impl<'a> Typecheck<'a> {
         let mut scope_count = 0;
         let returned_type;
         loop {
-            match self.typecheck_(expr, expected_type) {
+            let expected_type = expected_type.map(|t| self.instantiate(t));
+            match self.typecheck_(expr, expected_type.as_ref()) {
                 Ok(tailcall) => {
                     match tailcall {
                         TailCall::TailCall => {
@@ -878,7 +879,9 @@ impl<'a> Typecheck<'a> {
             Expr::Lambda(ref mut lambda) => {
                 let loc = format!("lambda:{}", expr.span.start);
                 lambda.id.name = self.symbols.symbol(loc);
-                let function_type = self.subs.new_var();
+                let function_type = expected_type
+                    .cloned()
+                    .unwrap_or_else(|| self.subs.new_var());
                 let typ = self.typecheck_lambda(function_type, &mut lambda.args, &mut lambda.body);
                 lambda.id.typ = typ.clone();
                 Ok(TailCall::Type(typ))
@@ -892,6 +895,11 @@ impl<'a> Typecheck<'a> {
                 ref mut types,
                 exprs: ref mut fields,
             } => {
+                let expected_type = expected_type.map(|expected_type| {
+                    resolve::remove_aliases_cow(&self.environment, expected_type)
+                });
+                let expected_type = expected_type.as_ref().map(|t| &**t);
+
                 let mut new_types: Vec<Field<_, _>> = Vec::with_capacity(types.len());
 
                 let mut duplicated_fields = FnvSet::default();
@@ -911,7 +919,16 @@ impl<'a> Typecheck<'a> {
                     let level = self.subs.var_id();
                     let typ = match field.value {
                         Some(ref mut expr) => {
-                            let mut typ = self.infer_expr(expr);
+                            let name = &field.name.value;
+                            let expected_type = expected_type
+                                .and_then(|expected_type| {
+                                    expected_type
+                                        .row_iter()
+                                        .find(|expected_field| expected_field.name.name_eq(&name))
+                                })
+                                .map(|field| &field.typ);
+                            let mut typ = self.typecheck_opt(expr, expected_type);
+
                             self.generalize_type(level, &mut typ);
                             new_skolem_scope(&self.subs, &FnvMap::default(), &typ)
                         }
@@ -963,8 +980,11 @@ impl<'a> Typecheck<'a> {
         let mut arg_types = Vec::new();
         let body_type = {
             let mut iter1 = function_arg_iter(self, function_type);
-            let mut iter2 = args.iter_mut();
-            while let (Some(arg_type), Some(arg)) = (iter1.next(), iter2.next()) {
+            for arg in args {
+                let arg_type = match iter1.next() {
+                    Some(arg_type) => arg_type,
+                    None => break,
+                };
                 let arg = &mut arg.value;
 
                 arg.typ = arg_type;

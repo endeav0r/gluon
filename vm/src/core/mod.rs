@@ -882,12 +882,8 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
                                                 .row_iter()
                                                 .find(|f| f.name.name_eq(&field.name.value))
                                                 .map(|f| f.typ.clone())
-                                                .unwrap_or_else(|| {
-                                                    panic!(
-                                                        "ICE: Expected record field, found `{}`",
-                                                        typ
-                                                    )
-                                                });
+                                                
+                                            .unwrap_or_else(|| Type::hole());
                                             Cow::Owned(spanned(
                                                 Span::default(),
                                                 ast::Pattern::Ident(TypedIdent {
@@ -1237,7 +1233,7 @@ impl<'a, 'e> PatternTranslator<'a, 'e> {
                                 .row_iter()
                                 .find(|f| f.name.name_eq(&field.name.value))
                                 .map(|f| f.typ.clone())
-                                .unwrap_or_else(|| panic!("ICE: Expected record found `{}`", typ));
+                                .unwrap_or_else(|| Type::hole());
                             record_fields.push((
                                 TypedIdent {
                                     name: field.name.value.clone(),
