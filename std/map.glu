@@ -1,10 +1,11 @@
-let prelude = import! "std/prelude.glu"
+let prelude = import! std.prelude
 let { Ordering, Ord, Semigroup, Monoid } = prelude
-let { Functor, Applicative, Foldable, Traversable } = prelude
+let { Functor, Applicative, Traversable } = prelude
+let { Foldable } = import! std.foldable
 
-let list = import! "std/list.glu"
-let { List } = list
-let { Option } = import! "std/option.glu"
+let { flip, const } = import! std.function
+let list @ { List } = import! std.list
+let { Option } = import! std.option
 
 type Map k a = | Bin k a (Map k a) (Map k a) | Tip
 
@@ -12,7 +13,7 @@ let empty = Tip
 
 let singleton k v = Bin k v empty empty
 
-and make ord : Ord k -> _ =
+let make ord : Ord k -> _ =
     let find k m : k -> Map k a -> Option a =
         match m with
         | Bin k2 v l r ->
@@ -62,18 +63,18 @@ and make ord : Ord k -> _ =
         | Bin k x l r -> foldl_with_key f (f (foldl_with_key f z l) k x) r
 
     let traverse_with_key app f m : Applicative t -> (k -> a -> t b) -> Map k a -> t (Map k b) =
-        let { map3 } = prelude.make_Applicative app
+        let { map3 } = import! std.applicative
 
         let go m =
             match m with
             | Tip -> app.wrap Tip
             | Bin k v l r ->
-                map3 (prelude.flip (Bin k)) (go l) (f k v) (go r)
+                map3 (flip (Bin k)) (go l) (f k v) (go r)
 
         go m
 
     let traverse app f : Applicative t -> (a -> t b) -> Map k a -> t (Map k b) =
-        traverse_with_key app (prelude.const f)
+        traverse_with_key app (const f)
 
     let append l r : Map k a -> Map k a -> Map k a = foldr_with_key insert l r
 
@@ -98,6 +99,7 @@ and make ord : Ord k -> _ =
         foldable,
         traversable,
         singleton,
+        empty,
         find,
         insert,
         map_with_key,
@@ -106,7 +108,7 @@ and make ord : Ord k -> _ =
         traverse_with_key,
         to_list,
         keys,
-        values
+        values,
     }
 
 { Map, make }

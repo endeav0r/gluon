@@ -1,21 +1,12 @@
 #!/bin/bash
+set -ex
 
-(
-  export TRAVIS_CARGO_NIGHTLY_FEATURE="nightly";
-  export RUST_BACKTRACE=1;
-  cargo test --features test --package gluon_base &&
-  cargo test --features test --package gluon_parser &&
-  cargo test --features test --package gluon_check &&
-  cargo test --features test --package gluon_completion &&
-  cargo test --features test --package gluon_vm &&
-  cargo test --features test --package gluon_format &&
-  cargo test --features test --package gluon &&
-  cargo test --features test --package gluon_repl &&
-  cargo test --features test --package gluon_c-api &&
-  travis-cargo --only nightly test -- --features "test nightly" -p gluon compile_test &&
-  cargo check --bench check --features test &&
-  cargo check --bench function_call --features test &&
-  cargo check --bench parser --features test &&
-  cargo check --bench precompiled --features test &&
-  travis-cargo --only stable build -- --all --no-default-features
-)
+export RUST_BACKTRACE=1
+
+cargo test --features "test test_skeptic" --all "$@"
+echo "" | cargo run --features "test" --example 24
+cargo check --benches --features test "$@"
+cargo check --all --no-default-features "$@"
+
+echo "TRAVIS_RUST_VERSION=$TRAVIS_RUST_VERSION"
+[ "$TRAVIS_RUST_VERSION" != "nightly" ] || cargo test --features "test nightly" -p gluon compile_test "$@"

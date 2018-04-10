@@ -1,6 +1,8 @@
 #![cfg(feature = "serialization")]
 extern crate futures;
 
+extern crate env_logger;
+
 extern crate serde_json;
 extern crate serde_state as serde;
 
@@ -19,11 +21,11 @@ use gluon::vm::thread::{RootedThread, RootedValue, Thread, ThreadInternal};
 use gluon::vm::serialization::{DeSeed, SeSeed};
 use gluon::vm::internal::Value;
 
-fn serialize_value(thread: &Thread, value: &Value) {
+fn serialize_value(value: &Value) {
     let mut buffer = Vec::new();
     {
         let mut ser = serde_json::Serializer::pretty(&mut buffer);
-        let ser_state = SeSeed::new(thread);
+        let ser_state = SeSeed::new();
         value.serialize_state(&mut ser, &ser_state).unwrap();
     }
     String::from_utf8(buffer).unwrap();
@@ -40,7 +42,7 @@ fn roundtrip<'t>(
     let mut buffer = Vec::new();
     {
         let mut ser = serde_json::Serializer::pretty(&mut buffer);
-        let ser_state = SeSeed::new(thread);
+        let ser_state = SeSeed::new();
         value.serialize_state(&mut ser, &ser_state).unwrap();
     }
     let buffer = from_utf8(&buffer).unwrap();
@@ -57,7 +59,7 @@ fn roundtrip<'t>(
     let mut buffer2 = Vec::new();
     {
         let mut ser = serde_json::Serializer::pretty(&mut buffer2);
-        let ser_state = SeSeed::new(thread);
+        let ser_state = SeSeed::new();
         value.serialize_state(&mut ser, &ser_state).unwrap();
     }
     assert_eq!(buffer, from_utf8(&buffer2).unwrap());
@@ -92,7 +94,7 @@ fn roundtrip_recursive_closure() {
 #[test]
 fn roundtrip_std_prelude() {
     let thread = new_vm();
-    let expr = r#" import! "std/prelude.glu" "#;
+    let expr = r#" import! std.prelude "#;
     let (value, _) = Compiler::new()
         .run_expr::<OpaqueValue<&Thread, Hole>>(&thread, "test", expr)
         .unwrap();
@@ -101,6 +103,8 @@ fn roundtrip_std_prelude() {
 
 #[test]
 fn roundtrip_std_libs() {
+    let _ = env_logger::try_init();
+
     let thread = new_vm();
     let mut expr = "{\n".to_string();
     for entry in std::fs::read_dir("std").unwrap() {
@@ -148,19 +152,48 @@ fn precompile() {
     let precompiled_result = {
         let mut deserializer = serde_json::Deserializer::from_slice(&buffer);
         Precompiled(&mut deserializer)
-            .run_expr(&mut Compiler::new(), &thread, "test", "", ())
+            .run_expr(&mut Compiler::new(), &*thread, "test", "", ())
             .wait()
             .unwrap()
     };
     let thread2 = new_vm();
     assert_eq!(
         serialize_value(
-            &thread2,
-            &text.run_expr(&mut Compiler::new(), &thread2, "test", &text, None)
+            &text.run_expr(&mut Compiler::new(), &*thread2, "test", &text, None)
                 .wait()
                 .unwrap()
                 .value
         ),
-        serialize_value(&thread, &precompiled_result.value)
+        serialize_value(&precompiled_result.value)
     );
+}
+
+#[test]
+fn roundtrip_reference() {
+    let thread = new_vm();
+    let expr = r#" import! std.reference "#;
+    let (value, _) = Compiler::new()
+        .run_expr::<OpaqueValue<&Thread, Hole>>(&thread, "test", &expr)
+        .unwrap_or_else(|err| panic!("{}", err));
+    roundtrip(&thread, &value);
+}
+
+#[test]
+fn roundtrip_lazy() {
+    let thread = new_vm();
+    let expr = r#" import! std.lazy "#;
+    let (value, _) = Compiler::new()
+        .run_expr::<OpaqueValue<&Thread, Hole>>(&thread, "test", &expr)
+        .unwrap_or_else(|err| panic!("{}", err));
+    roundtrip(&thread, &value);
+}
+
+#[test]
+fn roundtrip_thread() {
+    let thread = new_vm();
+    let expr = r#" import! std.thread "#;
+    let (value, _) = Compiler::new()
+        .run_expr::<OpaqueValue<&Thread, Hole>>(&thread, "test", &expr)
+        .unwrap_or_else(|err| panic!("{}", err));
+    roundtrip(&thread, &value);
 }

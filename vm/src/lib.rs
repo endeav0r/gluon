@@ -9,6 +9,8 @@ extern crate bitflags;
 extern crate collect_mac;
 #[cfg(test)]
 extern crate env_logger;
+#[doc(hidden)]
+pub extern crate frunk_core;
 #[macro_use]
 extern crate futures;
 extern crate itertools;
@@ -19,8 +21,8 @@ extern crate mopa;
 extern crate pretty;
 #[macro_use]
 extern crate quick_error;
-#[doc(hidden)]
-pub extern crate frunk_core;
+#[cfg(not(target_arch = "wasm32"))]
+extern crate tokio_core;
 
 #[cfg(feature = "serde_derive")]
 #[macro_use]
@@ -50,45 +52,50 @@ pub mod dynamic;
 #[macro_use]
 pub mod future;
 pub mod gc;
+pub mod lazy;
 pub mod macros;
 pub mod thread;
 pub mod primitives;
 pub mod reference;
 pub mod stack;
 pub mod types;
+pub mod vm;
 
 mod array;
-mod field_map;
 mod interner;
-mod lazy;
 mod source_map;
 mod value;
-mod vm;
 
 use std::marker::PhantomData;
 
-use api::ValueRef;
-use value::Value;
+use api::{ValueRef, VmType};
+use value::{Value, ValueRepr};
 use types::VmIndex;
 use base::types::ArcType;
 use base::symbol::Symbol;
+use base::metadata::Metadata;
+use thread::{RootedThread, RootedValue, Thread};
 
 unsafe fn forget_lifetime<'a, 'b, T: ?Sized>(x: &'a T) -> &'b T {
     ::std::mem::transmute(x)
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct Variants<'a>(Value, PhantomData<&'a Value>);
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Variants<'a>(ValueRepr, PhantomData<&'a Value>);
 
 impl<'a> Variants<'a> {
     /// Creates a new `Variants` value which assumes that `value` is rooted for the lifetime of the
     /// value
     pub unsafe fn new(value: &Value) -> Variants {
-        Variants::with_root(*value, value)
+        Variants::with_root(value.get_repr(), value)
     }
 
-    pub unsafe fn with_root<T: ?Sized>(value: Value, _root: &T) -> Variants {
+    pub(crate) unsafe fn with_root<T: ?Sized>(value: ValueRepr, _root: &T) -> Variants {
         Variants(value, PhantomData)
+    }
+
+    pub(crate) fn get_value(&self) -> Value {
+        self.0.into()
     }
 
     /// Returns an instance of `ValueRef` which allows users to safely retrieve the interals of a
@@ -123,7 +130,7 @@ quick_error! {
             display("No metadata exists for `{}`", symbol)
         }
         WrongType(expected: ArcType, actual: ArcType) {
-            display("Expected a value of type `{}` but the inferred type was `{}`",
+            display("Expected a value of type `{}` but the returned type was `{}`",
                     expected, actual)
         }
         OutOfMemory { limit: usize, needed: usize } {
@@ -136,14 +143,49 @@ quick_error! {
             display("{}", err)
             from()
         }
+        Interrupted {
+            display("Thread was interrupted")
+        }
         Panic(err: String) {
             display("{}", err)
         }
     }
 }
 
+pub type ExternLoader = fn(&Thread) -> Result<ExternModule>;
+
+pub struct ExternModule {
+    pub metadata: Metadata,
+    pub value: RootedValue<RootedThread>,
+    pub typ: ArcType,
+}
+
+impl ExternModule {
+    pub fn new<'vm, T>(thread: &'vm Thread, value: T) -> Result<ExternModule>
+    where
+        T: VmType + api::Pushable<'vm> + Send + Sync,
+    {
+        ExternModule::with_metadata(thread, value, Metadata::default())
+    }
+
+    pub fn with_metadata<'vm, T>(
+        thread: &'vm Thread,
+        value: T,
+        metadata: Metadata,
+    ) -> Result<ExternModule>
+    where
+        T: VmType + api::Pushable<'vm> + Send + Sync,
+    {
+        Ok(ExternModule {
+            value: value.marshal(thread)?,
+            typ: T::make_forall_type(thread),
+            metadata,
+        })
+    }
+}
+
 /// Internal types and functions exposed to the main `gluon` crate
 pub mod internal {
-    pub use value::{ClosureDataDef, Value, ValuePrinter};
+    pub use value::{Value, ValuePrinter};
     pub use vm::Global;
 }

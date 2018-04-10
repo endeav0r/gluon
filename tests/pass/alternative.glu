@@ -1,20 +1,29 @@
-let { run, writer, assert_eq }  = import! "std/test.glu"
-let prelude  = import! "std/prelude.glu"
-let { (*>) } = prelude.make_Applicative writer.applicative
-let int = import! "std/int.glu"
-let list = import! "std/list.glu"
-let option = import! "std/option.glu"
+let { run, Test, TestCase, assert_eq, test, group, ? } = import! std.test
+let { (<|) } = import! std.function
+let prelude @ { Alternative } = import! std.prelude
+let { Applicative, (*>) } = import! std.applicative
+let int = import! std.int
+let list @ { ? }= import! std.list
+let option = import! std.option
+let { (<|>), or, empty } = import! std.applicative
 
-let test_alt show eq alt =
-    let { (<|>), or, empty } = prelude.make_Alternative alt
+let test_alt ?alt show eq : [Alternative f] -> Show (f Int) -> Eq (f Int) -> _ =
     let { wrap } = alt.applicative
 
-    let assert = assert_eq (show int.show) (eq int.eq)
+    let assert = assert_eq ?show ?eq
 
-    assert empty empty
-        *> assert (empty <|> wrap 1) (wrap 1)
-        *> assert (empty <|> empty) empty
-        *> assert (empty <|> empty <|> wrap 10) (wrap 10)
+    [
+        test "empty equal" <| \_ -> (assert empty empty),
+        test "or selects non-empty" <| \_ -> (assert (empty <|> wrap 1) (wrap 1)),
+        test "empty <|> empty == empty" <| \_ -> (assert (empty <|> empty) empty),
+        test "or selects non-empty 2" <| \_ -> (assert (empty <|> empty <|> wrap 10) (wrap 10))
+    ]
 
-test_alt option.show option.eq option.alternative
-    *> test_alt list.show list.eq list.alternative
+let tests: TestCase () =
+    group "alternative" [
+        group "option" (test_alt option.show option.eq),
+        group "list" (test_alt list.show list.eq)
+    ]
+
+tests
+

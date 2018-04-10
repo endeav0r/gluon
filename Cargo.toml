@@ -1,7 +1,7 @@
 [package]
 
 name = "gluon"
-version = "0.6.1" # GLUON
+version = "0.7.1" # GLUON
 authors = ["Markus <marwes91@gmail.com>"]
 build = "build.rs"
 
@@ -14,7 +14,7 @@ documentation = "https://docs.rs/gluon"
 readme = "README.md"
 
 [workspace]
-members = ["c-api", "repl"]
+members = ["c-api", "repl", "completion", "format", "doc"]
 
 [lib]
 
@@ -22,16 +22,16 @@ name = "gluon"
 path = "src/lib.rs"
 
 [dependencies]
-gluon_base = { path = "base", version = "0.6.1" } # GLUON
-gluon_check = { path = "check", version = "0.6.1" } # GLUON
-gluon_parser = { path = "parser", version = "0.6.1" } # GLUON
-gluon_vm = { path = "vm", version = "0.6.1" } # GLUON
-gluon_format = { path = "format", version = "0.6.0" } #GLUON
+gluon_base = { path = "base", version = "0.7.1" } # GLUON
+gluon_check = { path = "check", version = "0.7.1" } # GLUON
+gluon_parser = { path = "parser", version = "0.7.1" } # GLUON
+gluon_vm = { path = "vm", version = "0.7.1", default-features = false } # GLUON
 
-log = "0.3.6"
+log = "0.4"
 quick-error = "1.0.0"
 collect-mac = "0.1.0"
 either = "1.0.0"
+itertools = "0.7.0"
 futures = "0.1.11"
 
 serde = { version = "1.0.0", optional = true }
@@ -41,17 +41,25 @@ serde_derive_state = { version = "0.4.0", optional = true }
 # Binding crates
 regex = { version = "0.2.1", optional = true }
 
-# Crates used in testing Testing
+# Crates used in testing
 compiletest_rs = { version = "0.3", optional = true }
-skeptic = { version = "0.6", optional = true }
+skeptic = { version = "0.13", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio-core = "0.1"
+rand = { version = "0.3", optional = true }
 
 [build-dependencies]
-skeptic = { version = "0.6", optional = true }
+skeptic = { version = "0.13", optional = true }
+walkdir = { version = "2", optional = true }
 
 [dev-dependencies]
 bencher = "0.1.2"
+tensile = "0.1.0"
 collect-mac = "0.1.0"
-env_logger = "0.3.4"
+env_logger = "0.5.0"
+pretty_assertions = "0.4"
+futures-cpupool = "0.1.8"
 
 hyper = "0.11.0"
 curl = "0.4.1"
@@ -62,15 +70,17 @@ serde_derive_state = { version = "0.4.0" }
 serde_json = "1.0.0"
 bincode = "0.8.0"
 
-gluon_completion = { path = "completion", version = "0.6.1" } # GLUON
+gluon_completion = { path = "completion", version = "0.7.1" } # GLUON
 
 [features]
-default = ["regex"]
+default = ["regex", "rand"]
 serialization = ["serde", "serde_state", "serde_derive_state", "gluon_vm/serialization"]
 
-test = ["serialization", "gluon_vm/test", "gluon_check/test", "gluon_parser/test", "gluon_format/test"]
-nightly = ["compiletest_rs"]
+docs_rs = ["serialization"]
 
+test = ["serialization", "gluon_vm/test", "gluon_check/test", "gluon_parser/test"]
+test_skeptic = ["skeptic", "walkdir"]
+nightly = ["compiletest_rs"]
 
 [[bench]]
 name = "check"
@@ -87,3 +97,52 @@ harness = false
 [[bench]]
 name = "precompiled"
 harness = false
+
+[[test]]
+name = "api"
+[[test]]
+name = "array"
+[[test]]
+name = "compiletest"
+[[test]]
+name = "de"
+[[test]]
+name = "debug"
+[[test]]
+name = "error"
+[[test]]
+name = "http"
+[[test]]
+name = "io"
+[[test]]
+name = "limits"
+[[test]]
+name = "main"
+harness = false
+[[test]]
+name = "metadata"
+[[test]]
+name = "parallel"
+[[test]]
+name = "pattern_match"
+[[test]]
+name = "regex_bind"
+[[test]]
+name = "row_polymorphism"
+[[test]]
+name = "safety"
+[[test]]
+name = "serialization"
+[[test]]
+name = "skeptic-tests"
+[[test]]
+name = "stack_overflow"
+[[test]]
+name = "tutorial"
+[[test]]
+name = "vm"
+[[test]]
+name = "ui"
+
+[package.metadata.docs.rs]
+features = ["docs_rs"]

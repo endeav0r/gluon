@@ -119,13 +119,13 @@ impl<'a> Index<&'a str> for OpTable {
     type Output = OpMeta;
 
     fn index(&self, name: &'a str) -> &OpMeta {
-        self.operators
-            .get(name)
-            .unwrap_or_else(|| if name.starts_with('#') {
+        self.operators.get(name).unwrap_or_else(|| {
+            if name.starts_with('#') {
                 &self[name[1..].trim_left_matches(char::is_alphanumeric)]
             } else {
                 &self.default_meta
-            })
+            }
+        })
     }
 }
 
@@ -159,11 +159,14 @@ impl<'s, Id> Reparser<'s, Id> {
     }
 }
 
-impl<'s, Id> MutVisitor for Reparser<'s, Id> {
+impl<'a, 's, Id> MutVisitor<'a> for Reparser<'s, Id>
+where
+    Id: 'a,
+{
     type Ident = Id;
 
     fn visit_expr(&mut self, e: &mut SpannedExpr<Self::Ident>) {
-        if let Expr::Infix(..) = e.value {
+        if let Expr::Infix { .. } = e.value {
             let dummy = pos::spanned2(
                 BytePos::from(0),
                 BytePos::from(0),
@@ -196,10 +199,7 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "left: `{} {}`, right: `{} {}`",
-                    lhs_meta,
-                    lhs_name,
-                    rhs_meta,
-                    rhs_name
+                    lhs_meta, lhs_name, rhs_meta, rhs_name
                 )
             }
         }
@@ -223,12 +223,20 @@ pub fn reparse<Id>(
     symbols: &IdentEnv<Ident = Id>,
     operators: &OpTable,
 ) -> Result<SpannedExpr<Id>, Spanned<Error, BytePos>> {
-    use base::pos;
     use self::Error::*;
+    use base::pos;
 
     let make_op = |lhs: Box<SpannedExpr<Id>>, op, rhs: Box<SpannedExpr<Id>>| {
         let span = pos::span(lhs.span.start, rhs.span.end);
-        Box::new(pos::spanned(span, Expr::Infix(lhs, op, rhs)))
+        Box::new(pos::spanned(
+            span,
+            Expr::Infix {
+                lhs,
+                op,
+                rhs,
+                implicit_args: Vec::new(),
+            },
+        ))
     };
 
     let mut infixes = Infixes::new(expr);
@@ -368,7 +376,16 @@ impl<Id> Iterator for Infixes<Id> {
         self.remaining_expr.take().map(|expr| {
             let expr = *expr; // Workaround for http://stackoverflow.com/questions/28466809/
             match expr.value {
-                Expr::Infix(lhs, op, rhs) => {
+                Expr::Infix {
+                    lhs,
+                    op,
+                    rhs,
+                    implicit_args,
+                } => {
+                    assert!(
+                        implicit_args.is_empty(),
+                        "Implicit args on infix operators is not implemented"
+                    );
                     self.remaining_expr = Some(rhs);
                     self.next_op = Some(op);
                     InfixToken::Arg(lhs)
@@ -385,8 +402,8 @@ mod tests {
     use base::pos::{self, BytePos, Spanned};
     use std::marker::PhantomData;
 
-    use super::{reparse, Fixity, InfixToken, Infixes, OpMeta, OpTable};
     use super::Error::*;
+    use super::{reparse, Fixity, InfixToken, Infixes, OpMeta, OpTable};
 
     pub struct MockEnv<T>(PhantomData<T>);
 
@@ -413,7 +430,6 @@ mod tests {
         }
     }
 
-
     fn no_loc<T>(value: T) -> Spanned<T, BytePos> {
         pos::spanned2(BytePos::from(0), BytePos::from(0), value)
     }
@@ -427,7 +443,12 @@ mod tests {
         op_str: &str,
         rhs: Box<SpannedExpr<String>>,
     ) -> Box<SpannedExpr<String>> {
-        Box::new(no_loc(Expr::Infix(lhs, no_loc(ident(op_str)), rhs)))
+        Box::new(no_loc(Expr::Infix {
+            lhs,
+            op: no_loc(ident(op_str)),
+            rhs,
+            implicit_args: Vec::new(),
+        }))
     }
 
     fn int(value: i64) -> Box<SpannedExpr<String>> {

@@ -3,18 +3,20 @@ use std::fmt;
 use std::fs::File;
 use std::sync::Mutex;
 
-use vm::{self, Result, Variants};
+use futures::Future;
+
+use vm::{self, ExternModule, Result};
+use vm::future::FutureValue;
 use vm::gc::{Gc, Traverseable};
 use vm::types::*;
-use vm::thread::ThreadInternal;
-use vm::thread::Thread;
-use vm::api::{Array, FunctionRef, Generic, Getable, Hole, OpaqueValue, Userdata, VmType, WithVM,
-              IO};
+use vm::thread::{Thread, ThreadInternal};
+use vm::api::{self, Array, FutureResult, Generic, Getable, OpaqueValue, OwnedFunction,
+              PrimitiveFuture, TypedBytecode, Userdata, VmType, WithVM, IO};
 use vm::api::generic::{A, B};
-use vm::stack::StackFrame;
+use vm::stack::{StackFrame, State};
 use vm::internal::ValuePrinter;
 
-use vm::internal::Value;
+use compiler_pipeline::*;
 
 use super::{Compiler, Error};
 
@@ -60,18 +62,10 @@ fn read_file<'vm>(file: WithVM<'vm, &GluonFile>, count: usize) -> IO<Array<'vm, 
     unsafe {
         buffer.set_len(count);
         match file.read(&mut *buffer) {
-            Ok(bytes_read) => {
-                let value = {
-                    let mut context = vm.context();
-                    match context.alloc(&buffer[..bytes_read]) {
-                        Ok(value) => value,
-                        Err(err) => return IO::Exception(format!("{}", err)),
-                    }
-                };
-                IO::Value(
-                    Getable::from_value(vm, Variants::new(&Value::Array(value))).expect("Array"),
-                )
-            }
+            Ok(bytes_read) => match api::convert::<_, Array<u8>>(vm, &buffer[..bytes_read]) {
+                Ok(v) => IO::Value(v),
+                Err(err) => IO::Exception(format!("{}", err)),
+            },
             Err(err) => IO::Exception(format!("{}", err)),
         }
     }
@@ -92,16 +86,12 @@ fn read_file_to_string(s: &str) -> IO<String> {
 
 fn read_char() -> IO<char> {
     match stdin().bytes().next() {
-        Some(result) => {
-            match result {
-                Ok(b) => {
-                    ::std::char::from_u32(b as u32)
-                        .map(IO::Value)
-                        .unwrap_or_else(|| IO::Exception("Not a valid char".into()))
-                }
-                Err(err) => IO::Exception(format!("{}", err)),
-            }
-        }
+        Some(result) => match result {
+            Ok(b) => ::std::char::from_u32(b as u32)
+                .map(IO::Value)
+                .unwrap_or_else(|| IO::Exception("Not a valid char".into())),
+            Err(err) => IO::Exception(format!("{}", err)),
+        },
         None => IO::Exception("No read".into()),
     }
 }
@@ -122,118 +112,148 @@ fn read_line() -> IO<String> {
 /// IO a -> (String -> IO a) -> IO a
 fn catch<'vm>(
     action: OpaqueValue<&'vm Thread, IO<A>>,
-    mut catch: FunctionRef<fn(String) -> IO<Generic<A>>>,
-) -> IO<Generic<A>> {
-    let vm = action.vm();
+    mut catch: OwnedFunction<fn(String) -> IO<Generic<A>>>,
+) -> FutureResult<Box<Future<Item = IO<Generic<A>>, Error = vm::Error> + Send>> {
+    let vm = action.vm().root_thread();
     let frame_level = vm.context().stack.get_frames().len();
-    let mut action: FunctionRef<fn(()) -> Generic<A>> =
-        unsafe { Getable::from_value(vm, Variants::new(&action.get_value())).unwrap() };
-    let result = action.call(());
-    match result {
-        Ok(value) => IO::Value(value),
+    let mut action: OwnedFunction<fn(()) -> Generic<A>> =
+        Getable::from_value(&vm, action.get_variant());
+
+    let future = action.call_fast_async(()).then(move |result| match result {
+        Ok(value) => FutureValue::Value(Ok(IO::Value(value))),
         Err(err) => {
             {
                 let mut context = vm.context();
                 let mut stack = StackFrame::current(&mut context.stack);
                 while stack.stack.get_frames().len() > frame_level {
                     if stack.exit_scope().is_err() {
-                        return IO::Exception("Unknown error".into());
+                        return FutureValue::Value(Ok(IO::Exception("Unknown error".into())));
                     }
                 }
             }
-            match catch.call(format!("{}", err)) {
-                Ok(value) => value,
-                Err(err) => IO::Exception(format!("{}", err)),
+            catch.call_fast_async(format!("{}", err)).then(|result| {
+                FutureValue::sync(Ok(match result {
+                    Ok(value) => value,
+                    Err(err) => IO::Exception(format!("{}", err)),
+                }))
+            })
+        }
+    });
+
+    FutureResult(Box::new(future))
+}
+
+fn clear_frames<T>(err: Error, stack: StackFrame) -> IO<T> {
+    fn clear_frames_(err: Error, mut stack: StackFrame) -> String {
+        let frame_level = stack
+            .stack
+            .get_frames()
+            .iter()
+            .rposition(|frame| frame.state == State::Lock)
+            .unwrap_or(0);
+
+        let fmt = match err {
+            Error::VM(vm::Error::Panic(_)) => {
+                let trace = stack.stack.stacktrace(frame_level);
+                format!("{}\n{}", err, trace)
             }
-        }
+            _ => format!("{}", err),
+        };
+        while let Ok(_) = stack.exit_scope() {}
+        fmt
+    }
+    IO::Exception(clear_frames_(err, stack))
+}
+
+field_decl! { value, typ }
+
+type RunExpr = record_type!{ value => String, typ => String };
+
+fn run_expr(WithVM { vm, value: expr }: WithVM<&str>) -> PrimitiveFuture<IO<RunExpr>> {
+    let vm = vm.root_thread();
+
+    let vm1 = vm.clone();
+    let future = expr.run_expr(&mut Compiler::new().run_io(true), vm1, "<top>", expr, None)
+        .then(move |run_result| {
+            let mut context = vm.context();
+            let stack = StackFrame::current(&mut context.stack);
+            FutureValue::sync(Ok(match run_result {
+                Ok(execute_value) => {
+                    let env = vm.global_env().get_env();
+                    let typ = execute_value.typ;
+                    IO::Value(record_no_decl!{
+                        value => ValuePrinter::new(&*env, &typ, execute_value.value.get_variant()).width(80).to_string(),
+                        typ => typ.to_string()
+                    })
+                }
+                Err(err) => clear_frames(err, stack),
+            }))
+        });
+
+    future.boxed()
+}
+
+fn load_script(
+    WithVM { vm, value: name }: WithVM<&str>,
+    expr: &str,
+) -> PrimitiveFuture<IO<String>> {
+    let vm1 = vm.root_thread();
+    let vm = vm.root_thread();
+    let name = name.to_string();
+    let future = expr.load_script(&mut Compiler::new(), vm1, &name, expr, None)
+        .then(move |run_result| {
+            let mut context = vm.context();
+            let stack = StackFrame::current(&mut context.stack);
+            let io = match run_result {
+                Ok(()) => IO::Value(format!("Loaded {}", name)),
+                Err(err) => clear_frames(err, stack),
+            };
+            Ok(io).into()
+        });
+    future.boxed()
+}
+
+mod std {
+    pub mod io {
+        pub use io as prim;
     }
 }
 
-fn clear_frames(err: Error, frame_level: usize, mut stack: StackFrame) -> IO<String> {
-    let fmt = match err {
-        Error::VM(vm::Error::Panic(_)) => {
-            let trace = stack.stack.stacktrace(frame_level);
-            format!("{}\n{}", err, trace)
-        }
-        _ => format!("{}", err),
-    };
-    while stack.stack.get_frames().len() > frame_level {
-        if stack.exit_scope().is_err() {
-            return IO::Exception(fmt);
-        }
-    }
-    IO::Exception(fmt)
-}
-
-fn run_expr(WithVM { vm, value: expr }: WithVM<&str>) -> IO<String> {
-    let frame_level = vm.context().stack.get_frames().len();
-    let run_result = Compiler::new().run_io_expr::<OpaqueValue<&Thread, Hole>>(vm, "<top>", expr);
-    let mut context = vm.context();
-    let stack = StackFrame::current(&mut context.stack);
-    match run_result {
-        Ok((value, typ)) => {
-            let env = vm.global_env().get_env();
-            unsafe {
-                IO::Value(format!(
-                    "{} : {}",
-                    ValuePrinter::new(&*env, &typ, value.get_value()).width(80),
-                    typ
-                ))
-            }
-        }
-        Err(err) => clear_frames(err, frame_level, stack),
-    }
-}
-
-fn load_script(WithVM { vm, value: name }: WithVM<&str>, expr: &str) -> IO<String> {
-    let frame_level = vm.context().stack.get_frames().len();
-    let run_result = Compiler::new()
-        .load_script_async(vm, name, expr)
-        .sync_or_error();
-    let mut context = vm.context();
-    let stack = StackFrame::current(&mut context.stack);
-    match run_result {
-        Ok(()) => IO::Value(format!("Loaded {}", name)),
-        Err(err) => clear_frames(err, frame_level, stack),
-    }
-}
-
-pub fn load(vm: &Thread) -> Result<()> {
+pub fn load(vm: &Thread) -> Result<ExternModule> {
     vm.register_type::<GluonFile>("File", &[])?;
 
-    // io_flat_map f m : (a -> IO b) -> IO a -> IO b
+    // flat_map f m : (a -> IO b) -> IO a -> IO b
     //     = f (m ())
-    let io_flat_map = vec![
+    let flat_map = vec![
         // [f, m, ()]       Initial stack
-        Call(1), // [f, m_ret]       Call m ()
-        PushInt(0), // [f, m_ret, ()]   Add a dummy argument ()
-        TailCall(2) /* [f_ret]          Call f m_ret () */,
+        Call(1),     // [f, m_ret]       Call m ()
+        PushInt(0),  // [f, m_ret, ()]   Add a dummy argument ()
+        TailCall(2), /* [f_ret]          Call f m_ret () */
     ];
 
     type FlatMap = fn(fn(A) -> IO<B>, IO<A>) -> IO<B>;
     type Wrap = fn(A) -> IO<A>;
-    let flat_map_ty = <FlatMap as VmType>::make_type(vm);
-    let wrap_ty = <Wrap as VmType>::make_type(vm);
 
-    vm.add_bytecode("io_flat_map", flat_map_ty, 3, io_flat_map)?;
-    vm.add_bytecode("io_wrap", wrap_ty, 2, vec![Pop(1)])?;
+    let wrap = vec![Pop(1)];
+
+    use self::std;
 
     // IO functions
-    use super::io as io_prim;
-    vm.define_global(
-        "io_prim",
+    ExternModule::new(
+        vm,
         record! {
-            open_file => primitive!(1 io_prim::open_file),
-            read_file => primitive!(2 io_prim::read_file),
-            read_file_to_string => primitive!(1 io_prim::read_file_to_string),
-            read_char => primitive!(0 io_prim::read_char),
-            read_line => primitive!(0 io_prim::read_line),
-            print => primitive!(1 io_prim::print),
-            println => primitive!(1 io_prim::println),
-            catch => primitive!(2 io_prim::catch),
-            run_expr => primitive!(1 io_prim::run_expr),
-            load_script => primitive!(2 io_prim::load_script)
+            flat_map => TypedBytecode::<FlatMap>::new("std.io.prim.flat_map", 3, flat_map),
+            wrap => TypedBytecode::<Wrap>::new("std.io.prim.wrap", 2, wrap),
+            open_file => primitive!(1 std::io::prim::open_file),
+            read_file => primitive!(2 std::io::prim::read_file),
+            read_file_to_string => primitive!(1 std::io::prim::read_file_to_string),
+            read_char => primitive!(0 std::io::prim::read_char),
+            read_line => primitive!(0 std::io::prim::read_line),
+            print => primitive!(1 std::io::prim::print),
+            println => primitive!(1 std::io::prim::println),
+            catch => primitive!(2 std::io::prim::catch),
+            run_expr => primitive!(1 std::io::prim::run_expr),
+            load_script => primitive!(2 std::io::prim::load_script),
         },
-    )?;
-    Ok(())
+    )
 }

@@ -1,42 +1,14 @@
-# Tutorial
+# Syntax and semantics
 
-[Introduction](#introduction)
-
-[Syntax and semantics](#syntax-and-semantics)
-
-[Indentation](#indentation)
-
-[Importing modules](#importing-modules)
-
-[Writing modules](#writing-modules)
-
-[Embedding API](#embedding-api)
-
-[Standard types and functions](#standard-types-and-functions)
-
-## Introduction
-
-This tutorial aims the explain the basics of gluon's syntax and semantics.
-
-## Hello world
-
-In traditional form, we will begin with the classic hello world program.
-
-```f#,rust
-io.println "Hello world"
-```
-
-## Syntax and semantics
-
-gluon is a functional language at heart, basing its syntax on languages such as F#, OCaml and Haskell.
+Gluon is a functional language at heart, basing its syntax on languages such as F#, OCaml and Haskell.
 The syntax may thus look strange if you are coming from C-like languages but don't be discouraged!
 There is actually very little syntax to learn.
 
-If, on the other hand, you are familiar with functional languages you will be right at home. Roughly speaking, gluon takes the expression syntax from F# and OCaml but uses the type syntax of Haskell.
+If, on the other hand, you are familiar with functional languages you will be right at home. Roughly speaking, Gluon takes the expression syntax from F# and OCaml and uses the type syntax of Haskell.
 
 ### Identifiers and Literals
 
-The simplest syntactical elements in gluon are identifiers and literals and none of them should be especially surprising if you are experienced in programming. 
+The simplest syntactical elements in Gluon are identifiers and literals and none of them should be especially surprising if you are experienced in programming. 
 
 Identifiers are a sequence of alphanumeric characters including underscore ("\_") which are required to start with either a letter or an underscore. Literals come in four different forms - integer, float, string and character literals.
 
@@ -120,7 +92,7 @@ if True then 1 else 0
 
 ### Record expressions
 
-To create more complex data types, gluon has first class records. Records can be used to couple data that is logically grouped into a single type.
+To create more complex data types, Gluon has first class records. Records can be used to couple data that is logically grouped into a single type.
 
 ```f#,rust
 { pi = 3.14, add1 = (+) 1.0 }
@@ -140,6 +112,20 @@ let id x = x
 in { id }
 ```
 
+The `..` operator can be used at the end of a record expression to take all fields of one record and fill the constructed record.
+
+```f#, rust
+let large_record = { x = 1, y = 2, name = "gluon" }
+in
+// Results in a record with type
+// { field : Bool, x : Int, y : Int, name : String }
+{
+    field = True,
+    ..
+    large_record
+}
+```
+
 ### Array expressions
 
 Arrays can be constructed with array literals.
@@ -149,7 +135,7 @@ Arrays can be constructed with array literals.
 [1, 2, 3, 4]
 ```
 
-Since gluon is statically typed all values must be of the same type. This allows the gluon interpreter to avoid tagging each value individually which makes types such as `Array Byte` be convertible into Rust's `&[u8]` type without any allocations.
+Since Gluon is statically typed all values must be of the same type. This allows the Gluon interpreter to avoid tagging each value individually which makes types such as `Array Byte` be convertible into Rust's `&[u8]` type without any allocations.
 
 ```f#
 // ERROR:
@@ -176,7 +162,7 @@ Some 1
 
 ### Match expressions
 
-To allow variants to be unpacked so their contents can be retrieved, gluon has the `match` expression.
+To allow variants to be unpacked so their contents can be retrieved, Gluon has the `match` expression.
 
 ```f#,rust
 match None with
@@ -201,7 +187,7 @@ match { x = Some (Some 123) } with
 
 `let` bindings can also match and unpack on data but only with irrefutable patterns. In other words, only with patterns which cannot fail.
 
-```f#
+```f#,ignore
 // Matching on records will always succeed since they are the only variant
 let { x = y, pi } = { x = 1.0, pi = 3.14 }
 in y + pi
@@ -222,7 +208,7 @@ Gluon also have tuple expressions for when you don't have sensible names for you
 
 Similarily to records they can be unpacked with `match` and `let`.
 
-```f#,rust
+```f#
 match (1, None) with
 | (x, Some y) -> x + y
 | (x, None) -> x
@@ -233,7 +219,7 @@ a + b
 
 Infact, tuples are only syntax sugar over records with fields named after numbers (`_0`, `_1`, ...) which makes the above equivalent to the following code.
 
-```f#,rust
+```f#
 match { _0 = 1, _1 = None } with
 | { _0 = x, _1 = Some y } -> x + y
 | { _0 = x, _1 = None } -> x
@@ -261,7 +247,7 @@ let f x y = x + y - 10 in f
 
 ### Type expressions
 
-gluon allows new types to be defined through the `type` expression which, just like `let`, requires `in <expression>` to be written at the end to ensure it returns a value.
+Gluon allows new types to be defined through the `type` expression which, just like `let`, requires `in <expression>` to be written at the end to ensure it returns a value.
 
 ```f#,rust
 // type <identifier> <identifier>* = <type> in <expression>
@@ -294,9 +280,24 @@ and SExpr = { location: Int, expr: SExpr_ }
 in Atom "name"
 ```
 
+### Do expressions
+
+`do` expressions are syntax sugar over the commonly used `Monad` type which is used to encapsulate side-effects. By using `do` instead of `>>=` or `flat_map` we can write our code in a sequential manner instead of the closures necessary for sugar free versions. Note `do` still requires a `flat_map` binding to be in scope with the correct type or else you will get an error during typechecking.
+
+```f#
+Some 1 >>= (\x -> Some (x + 2))
+// or
+flat_map (\x -> Some (x + 2)) (Some 1)
+
+// are equivalent to
+
+do x = Some 1
+Some (x + 2)
+```
+
 ### Indentation
 
-If you have been following along this far, you may be think that the syntax so far is pretty limiting. In particular, you wouldn't be wrong in thinking that the `let` and `type` syntax are clunky due to their need to be closed by the `in` keyword. Luckily, gluon offers a more convenient way of writing bindings by relying on indentation.
+If you have been following along this far, you may be think that the syntax so far is pretty limiting. In particular, you wouldn't be wrong in thinking that the `let` and `type` syntax are clunky due to their need to be closed by the `in` keyword. Luckily, Gluon offers a more convenient way of writing bindings by relying on indentation.
 
 When a token starts on the same column as an unclosed `let` or `type` expression, the lexer implicitly inserts an `in` token which closes the declaration part and makes the following expression into the body.
 
@@ -305,7 +306,7 @@ let add1 x = x + 1
 add1 11 // `in` will be inserted automatically since `add1 11` starts on the same line as the opening `let`
 ```
 
-If a token starts on the same column as an earlier expression, but there is not an unclosed `type` or `let` expression, gluon treats the code as a block expression, meaning each expression is run sequentially, returning the value of the last expression.
+If a token starts on the same column as an earlier expression, but there is not an unclosed `type` or `let` expression, Gluon treats the code as a block expression, meaning each expression is run sequentially, returning the value of the last expression.
 
 ```f#
 do_something1 ()
@@ -355,9 +356,9 @@ Function types are written using the `(->)` operator, which is right associative
 { pi : Float, sin : Float -> Float }
 ```
 
-Records are gluon's main way of creating associating related data and they should look quite familiar if you are familiar with dynamic languages such as javascript. Looks can be deceiving however as gluon's records are more similar to a struct in Rust or C as the order of the fields are significant, `{ x : Int, y : String } != { y : String, x : Int }`. Furthermore, records are immutable, meaning fields cannot be added nor removed and the values within cannot be modified.
+Records are Gluon's main way of creating associating related data and they should look quite familiar if you are familiar with dynamic languages such as javascript. Looks can be deceiving however as gluon's records are more similar to a struct in Rust or C as the order of the fields are significant, `{ x : Int, y : String } != { y : String, x : Int }`. Furthermore, records are immutable, meaning fields cannot be added nor removed and the values within cannot be modified.
 
-In addition to storing values, records also have a secondary function of storing types which is gluon's way of exporting types. If you have used modules in an ML language, this may look rather familiar. Looks can be deceiving however as 'type fields' must match exactly in gluon which means there is no subtyping relationship between records (`{ Test = { x : Int } }` is not a subtype of `{ Test = Float }`). This may change in the future.
+In addition to storing values, records also have a secondary function of storing types which is Gluon's way of exporting types. If you have used modules in an ML language, this may look rather familiar. Looks can be deceiving however as 'type fields' must match exactly in gluon which means there is no subtyping relationship between records (`{ Test = { x : Int } }` is not a subtype of `{ Test = Float }`). This may change in the future.
 
 ```f#
 { Test = { x : Int } }
@@ -371,7 +372,7 @@ In addition to storing values, records also have a secondary function of storing
 | Err e | Ok t
 ```
 
-Gluon also has a second way of grouping data which is the enumeration type which allows you to represent a value being one of several variants. In the example above is the representation of gluon's standard `Result` type. It represents either the value having been successfully computed (`Ok t`) or that an error occurred (`Err e`).
+Gluon also has a second way of grouping data which is the enumeration type which allows you to represent a value being one of several variants. In the example above is the representation of Gluon's standard `Result` type. It represents either the value having been successfully computed (`Ok t`) or that an error occurred (`Err e`).
 
 ### Alias type
 
@@ -383,32 +384,118 @@ Option Int
 Ref String
 ```
 
-The last kind of type which gluon has is the alias type. An alias type explicitly names some underlying type which can either be one of the three types mentioned above or an abstract type which is the case for the `Int`, `String` and `Ref` types. If the underlying type is abstract, then the type is only considered equivalent to itself (ie if you define an abstract type of `MyInt` which happens to have the same representation as `Int` the typechecker will consider these two types as being distinct).
+The last kind of type which Gluon has is the alias type. An alias type explicitly names some underlying type which can either be one of the three types mentioned above or an abstract type which is the case for the `Int`, `String` and `Ref` types. If the underlying type is abstract, then the type is only considered equivalent to itself (ie if you define an abstract type of `MyInt` which happens to have the same representation as `Int` the typechecker will consider these two types as being distinct).
 
 ### Higher-kinded types
 
-Higher-kinded types are a fairly abstract concept in gluon and you may create entire programs without any knowledge about them. Sometimes they are a very valuable tool to have, as they can be used to create very powerful abstractions.
+Higher-kinded types are a fairly abstract concept in Gluon and you may create entire programs without any knowledge about them. Sometimes they are a very valuable tool to have, as they can be used to create very powerful abstractions.
 
 Just as all values such as `0 : Int`, `"Hello World!" : String` and `Some 4.0 : Option Float` each have a type, these types themselves have their own 'type' or the 'kind' as it is called. For the types of concrete values the `Kind` is always `Type` so for the earlier examples `Int : Type`, `String : Type` and `Option Float : Type`. That is not very useful on its own but it becomes more interesting when we consider the kind of `Option : Type -> Type`. `Type -> Type` looks rather like the type of a function such as `show_int : Int -> String` but, instead of taking a value, it takes a type and produces a new type. In effect, this lets us abstract over types instead of just over values. This abstraction facility can be seen in the `Functor : (Type -> Type) -> Type` type which takes a type with kind `Type -> Type` as argument which is exactly the kind of `Option` (or `List`, `Result a`).
 
-### Overloading
+### Universal quantification
 
-Sometimes, there is a need to overload a name with multiple differing implementations and let the compiler chose the correct implementation. If you have written any amount of Gluon code so far, you are likely to have already encountered this with numeric operators such as `(+)` or comparison operators such as `(==)`. While these operators are core parts of gluon they are not special-cased by the compiler which lets you define and use overloaded bindings yourself.
+*First draft*
 
-To explain how overloading works, first look at the example below where `show_type` has two implementations; one which takes an `Int` and one which takes a `Float`.
+Universal quantification is what Gluon's "generic types" are called. Consider the identity function in Rust.
 
-```f#,rust
-let show_type _ : Int -> String = "Int"
-let show_type _ : Float -> String = "Float"
-
-show_type 0 // Returns "Int"
-show_type 0.0 // Returns "Float"
-// show_type "" // Would be a type error
+```rust,ignore
+fn id<T>(x: T) -> T {
+    x
+}
 ```
 
-When the typechecker encounters the second `show_type` binding in this example, it does not simply shadow the first binding as is common in many programming languages. Instead, the typechecker checks the type of the binding already in scope and calculates the 'intersection' of the two bindings. In the example above, the first binding has the type `Int -> String` while the second is `Float -> String`. By calculating the 'intersection', the typechecker calculates the most specialized type which both bindings can still successfully unify to which in this case is `a -> String`. Any subsequent use of `show_type` will then be observed as `a -> String` which succeeds with both a `Int` and `Float` argument.
+In Gluon the same function would be written in the following way if it were fully annotated.
 
-Unfortunately, it would also succeed if a `String` (or any other) type were used as the argument which is not acceptable as we have only implemented `show_type` for `Int` and `Float`. To catch this case (and to figure out which overload should be use where), the typechecker does an extra pass after successfully typechecking the entire expression. In this pass, all uses of overloaded bindings are checked against the overload candidates until a match is found. Thus, the third call, were it not commented out, would produce an error as there is no overloaded binding matching the type `String -> String`.
+```f#
+let id x : forall a . a -> a = x
+```
+
+```f#
+// Types can of course be omitted in which the same type as above will be inferred
+let id x = x
+// Unbound type variables (`a` in this example) are allowed, in which case a `forall` will be
+// inserted at the at the "top" of the type (same place as the type above)
+let id x : a -> a = x
+```
+
+So in simple case, `forall` is no different from declaring type parameters to a function in Rust. But `forall` also serves more advanced use cases and is at the center when it comes to making Gluon's records work as modules.
+
+```f#
+let module =
+    let id x = x
+
+    { id }
+
+module.id 0
+module.id ""
+```
+
+If we were to emulate the above code in Rust we would probably end up with something like this code.
+
+```rust,ignore
+struct Module<T> {
+    id : Box<Fn(T) -> T>,
+}
+
+let module = Module {
+    id: Box::new(|x| x),
+};
+(module.id)(0);
+(module.id)("");
+```
+
+Alas, this does not work in Rust since `module` will be inferred to the type `Module<i32>` which makes the second call to `id` a type error. In gluon it works as the type of `module` is actually `{ id : forall a . a -> a }` and not `forall a . { id : a -> a }` which is the closest analogue to the Rust example.
+
+Intuitively, we can say that since gluon lets `forall` be specified inside types we can avoid specializing the type (in this case `forall a . a -> a`) which lets us specialize `module.id` once for each call to `id` instead of specializing the entire module at once.
+
+While all of this looks quite complex, it should for the most part not matter when writing code and common idioms will just work as expected!
+
+### Implicit arguments
+
+Sometimes, there is a need to overload a name with multiple differing implementations and let the compiler chose the correct implementation. If you have written any amount of Gluon code so far, you are likely to have already encountered this with numeric operators such as `(+)` or comparison operators such as `(==)`. If you inspect the types of these functions you will find that the first argument of these functions look a little bit different from normal functions.
+
+```gluon
+(==): : forall a . [std.prelude.Eq a] -> a -> a -> std.types.Bool
+(+): forall a . [std.prelude.Num a] -> a -> a -> a
+```
+
+This different looking argument is an implicit argument which means that you do not need to pass a value for this argument, instead, the compiler will try to find a value with a type that matches the type signature. So if you were to call `1 == 2` the compiler will see that the type variable `a` has been unified to `Int`. Then when the implicit argument is resolved it will look for a value with the type `Eq Int`.
+
+Since searching all possible bindings currently in scope would introduce to many ambiguity errors the compiler does not search all bindings when trying to determine an implicit argument. Instead, whether a binding is considered for implicit resolution is controlled by the `@implicit` attribute. When marking a `let` binding as `@implicit` and this binding is in scope it will be considered as a candidate for all implicit arguments. The `@implicit` attribute can also be set on a `type` binding in which case it applied to all `let` bindings which has the type declared by the `type` binding.
+
+```f#,rust
+/// @implicit
+type Test = | Test ()
+let f y: [a] -> a -> a = y
+let i = Test ()
+// `i` gets selected as the implicit argument since `@implicit` is marked on the type and `i : Test`
+()
+```
+
+#### Passing implicit arguments explicitly
+
+If you only use implicit functions as explained above then it might just seem like a different name for traits (Rust) or type classes (Haskell). While it is true that the main reason for implicit arguments is to emulate traits/type classes implicit arguments is more powerful than those approaches as it is also possible to override the implicit resolution and instead give the argument explicitly by prefixing the argument with `?`.
+
+```f#,rust
+let list @ { List } = import! std.list
+// Make a custom equality function which returns true regardless of the elements of the list
+let { (==) = (===) } = list.eq ?{ (==) = \x y -> True }
+Cons 1 (Cons 2 Nil) === Cons 3 (Cons 4 Nil)
+```
+
+The inverse also works when defining a function with implicit arguments. By prefixing an argument by `?` an implicit arguments will be given a name inside the function (if `?` is not given in a function definition the argument will only be available for implicit resolution).
+
+```f#,rust
+let eq ?a : [Eq a] -> Eq (Option a) = {
+    (==) = \l r ->
+        match (l, r) with
+        | (Some l_val, Some r_val) -> a.(==) l_val r_val
+        | (None, None) -> True
+        | _ -> False,
+}
+()
+```
+
 
 ## Importing modules
 
@@ -417,7 +504,7 @@ As is often the case, it is convenient to separate code into multiple files whic
 For example, say that we need the `assert` function from the `test` module which can be found at `std/test.glu`. We might write something like this:
 
 ```f#,rust
-let { assert }  = import! "std/test.glu"
+let { assert } = import! std.test
 assert (1 == 1)
 ```
 
@@ -448,91 +535,3 @@ Though modules are most commonly a record, this does not have to be the case. If
 let pi  = import! "pi.glu"
 2 * pi * 10
 ```
-
-## Embedding API
-
-The API with which the host language interacts with gluon is very important part of the library. While the complete API can be found in the [Rustdoc][], this section will explain the most important parts. Please note that the API can change at any point and there are still some public functions which should actually be internal.
-
-### Creating a virtual machine
-
-Before you are able to do anything with the library, you will need to create a virtual machine. The virtual machine is responsible for running gluon programs and can be created with the [new_vm][] function.
-
-### Compiling and running gluon code
-
-Once in possession of a [RootedThread][], you can compile and execute code using the [run_expr][] method on the [Compiler][] builder type.
-
-```rust,ignore
-let vm = new_vm();
-let (result, _) = Compiler::new()
-    .run_expr::<i32>(&vm, "example", "1 + 2")
-    .ok();
-assert_eq!(result, Some(3));
-```
-
-Often, it is either inconvenient or inefficient to compile and run code directly from source code. To write the above example in a more efficient way, we could instead load the `(+)` function and call it directly.
-
-```rust,ignore
-let vm = new_vm();
-// Ensure that the prelude module is loaded before trying to access something from it
-Compiler::new()
-    .run_expr::<OpaqueValue<&Thread, Hole>>(&vm, "example", r#" import! "std/prelude.glu" "#)
-    .unwrap();
-let mut add: FunctionRef<fn (i32, i32) -> i32> = vm.get_global("std.prelude.num_Int.(+)")
-    .unwrap();
-let result = add.call(1, 2);
-assert_eq!(result, Ok(3));
-```
-
-### Calling Rust functions from gluon
-
-gluon also allows native functions to be called from gluon. To do this we first need to define the function so it is available when running gluon code.
-
-```rust,ignore
-fn factorial(x: i32) -> i32 {
-    if x <= 1 { 1 } else { x * factorial(x - 1) }
-}
-let vm = new_vm();
-vm.define_global("factorial", factorial as fn (_) -> _)
-    .unwrap();
-let (result, _) = Compiler::new()
-    .run_expr::<i32>(&vm, "example", "factorial 5")
-    .unwrap();
-assert_eq!(result, 120);
-```
-
-[define_global][] can do more than just exposing simple functions. For instance, the [primitives][] module export large parts of Rust's [string][] and [float][] modules directly as records in gluon under the `str` and `float` modules respectively.
-
-```rust,ignore
-let vm = new_vm();
-let (result, _) = Compiler::new()
-    .run_expr::<String>(&vm, "example", " let string  = import! \"std/string.glu\" in string.trim \"  Hello world  \t\" ")
-    .unwrap();
-assert_eq!(result, "Hello world");
-```
-
-[Rustdoc]:https://docs.rs/gluon/*/gluon/index.html
-[new_vm]:https://docs.rs/gluon/*/gluon/fn.new_vm.html
-[RootedThread]:https://docs.rs/gluon/*/gluon/struct.RootedThread.html
-[Thread]:https://docs.rs/gluon/*/gluon/struct.Thread.html
-[run_expr]:https://docs.rs/gluon/*/gluon/struct.Compiler.html#method.run_expr
-[Compiler struct]:https://docs.rs/gluon/*/gluon/struct.Compiler.html
-[define_global]:https://docs.rs/gluon/*/vm/thread/struct.Thread.html#method.define_global
-[primitives]:https://github.com/gluon-lang/gluon/blob/master/vm/src/primitives.rs
-[string]:http://doc.rust-lang.org/std/primitive.str.html
-[float]:http://doc.rust-lang.org/std/primitive.f64.html
-
-## Standard types and functions
-
-https://github.com/gluon-lang/gluon/tree/master/std
-
-TODO
-
-### Prelude
-
-When compiling an expression, the compiler automatically inserts a small prelude before the expression itself, which gives automatic access to basic operators such as `+`, `-`, etc as well as types such as `Option` and `Result`.
-
-### Threads and channels
-
-gluon has support for cooperative threading and communication between them through the `Thread` and `Sender`/`Receiver` types.
-
-TODO

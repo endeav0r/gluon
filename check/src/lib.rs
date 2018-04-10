@@ -3,47 +3,49 @@
 //! If an AST passes the checks in `Typecheck::typecheck_expr` (which runs all of theses checks
 //! the expression is expected to compile succesfully (if it does not it should be considered an
 //! internal compiler error.
-#![doc(html_root_url = "https://docs.rs/gluon_check/0.6.1")] // # GLUON
+#![doc(html_root_url = "https://docs.rs/gluon_check/0.7.1")] // # GLUON
 
+#[macro_use]
+extern crate collect_mac;
 #[cfg(test)]
 extern crate env_logger;
 extern crate itertools;
 #[macro_use]
 extern crate log;
 extern crate pretty;
+extern crate rpds;
+extern crate smallvec;
+extern crate strsim;
 extern crate union_find;
 
 #[macro_use]
 extern crate gluon_base as base;
 
-pub mod typecheck;
-pub mod unify_type;
-pub mod unify;
 pub mod kindcheck;
-pub mod substitution;
-pub mod rename;
 pub mod metadata;
+pub mod rename;
+pub mod substitution;
+pub mod typecheck;
+pub mod unify;
+pub mod unify_type;
+
+mod implicits;
 
 use base::types::{ArcType, TypeEnv};
 
 /// Checks if `actual` can be assigned to a binding with the type signature `signature`
 pub fn check_signature(env: &TypeEnv, signature: &ArcType, actual: &ArcType) -> bool {
+    use base::fnv::FnvMap;
     use base::kind::Kind;
     use base::scoped_map::ScopedMap;
-    use base::fnv::FnvMap;
 
     use substitution::Substitution;
 
     let subs = Substitution::new(Kind::typ());
     let state = unify_type::State::new(env, &subs);
-    let actual = unify_type::instantiate_generic_variables(
-        &mut FnvMap::default(),
-        &subs,
-        &FnvMap::default(),
-        actual,
-    );
-    let result =
-        unify_type::merge_signature(&subs, &mut ScopedMap::new(), 0, state, signature, &actual);
+    let actual = unify_type::new_skolem_scope(&subs, actual);
+    let actual = actual.instantiate_generics(&mut FnvMap::default());
+    let result = unify_type::subsumes(&subs, &mut ScopedMap::new(), 0, state, signature, &actual);
     if let Err(ref err) = result {
         debug!("Check signature error: {}", err);
     }
@@ -57,7 +59,7 @@ mod tests {
 
     use base::kind::{ArcKind, KindEnv};
     use base::symbol::{Symbol, SymbolModule, SymbolRef, Symbols};
-    use base::types::{Alias, ArcType, RecordSelector, TypeEnv};
+    use base::types::{Alias, ArcType, TypeEnv};
 
     pub struct MockEnv;
 
@@ -72,13 +74,6 @@ mod tests {
             None
         }
         fn find_type_info(&self, _id: &SymbolRef) -> Option<&Alias<Symbol, ArcType>> {
-            None
-        }
-        fn find_record(
-            &self,
-            _fields: &[Symbol],
-            _selector: RecordSelector,
-        ) -> Option<(ArcType, ArcType)> {
             None
         }
     }

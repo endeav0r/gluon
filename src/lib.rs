@@ -4,14 +4,20 @@
 //! behaviour. For information about how to use this library the best resource currently is the
 //! [tutorial](https://github.com/gluon-lang/gluon/blob/master/TUTORIAL.md) which contains examples
 //! on how to write gluon programs as well as how to run them using this library.
-#![doc(html_root_url = "https://docs.rs/gluon/0.6.1")] // # GLUON
+#![doc(html_root_url = "https://docs.rs/gluon/0.7.1")] // # GLUON
 
+#[cfg(test)]
+extern crate env_logger;
+
+pub extern crate either;
 extern crate futures;
+extern crate itertools;
 #[macro_use]
 extern crate log;
 #[macro_use]
 extern crate quick_error;
-pub extern crate either;
+#[cfg(not(target_arch = "wasm32"))]
+extern crate tokio_core;
 
 #[cfg(feature = "serde_derive_state")]
 #[macro_use]
@@ -19,9 +25,9 @@ extern crate serde_derive_state;
 #[cfg(feature = "serde")]
 extern crate serde_state as serde;
 
+#[macro_use]
 pub extern crate gluon_base as base;
 pub extern crate gluon_check as check;
-pub extern crate gluon_format as format;
 pub extern crate gluon_parser as parser;
 #[macro_use]
 pub extern crate gluon_vm as vm;
@@ -31,33 +37,36 @@ pub mod import;
 pub mod io;
 #[cfg(feature = "regex")]
 pub mod regex_bind;
+#[cfg(all(feature = "rand", not(target_arch = "wasm32")))]
+pub mod rand_bind;
 
 pub use vm::thread::{RootedThread, Thread};
 
 pub use futures::Future;
 
-#[cfg(feature = "serialization")]
 use either::Either;
 
+use std::error::Error as StdError;
 use std::result::Result as StdResult;
-use std::string::String as StdString;
 use std::env;
+use std::path::PathBuf;
 
+use base::filename_to_module;
 use base::ast::{self, SpannedExpr};
 use base::error::{Errors, InFile};
 use base::metadata::Metadata;
 use base::symbol::{Symbol, SymbolModule, Symbols};
 use base::types::{ArcType, TypeCache};
-use check::typecheck::TypeError;
+use base::pos::{self, BytePos, Span, Spanned};
+
 use vm::Variants;
 use vm::api::{Getable, Hole, OpaqueValue, VmType};
-use vm::Error as VmError;
 use vm::future::{BoxFutureValue, FutureValue};
-use vm::compiler::CompiledFunction;
+use vm::compiler::CompiledModule;
 use vm::thread::ThreadInternal;
 use vm::macros;
 use compiler_pipeline::*;
-use import::{DefaultImporter, Import};
+use import::{add_extern_module, DefaultImporter, Import};
 
 quick_error! {
     /// Error type wrapping all possible errors that can be generated from gluon
@@ -70,7 +79,7 @@ quick_error! {
             from()
         }
         /// Error found when typechecking gluon code
-        Typecheck(err: InFile<TypeError<Symbol>>) {
+        Typecheck(err: InFile<check::typecheck::HelpError<Symbol>>) {
             description(err.description())
             display("{}", err)
             from()
@@ -88,7 +97,12 @@ quick_error! {
             from()
         }
         /// Error found when expanding macros
-        Macro(err: macros::Error) {
+        Macro(err: InFile<macros::Error>) {
+            description(err.description())
+            display("{}", err)
+            from()
+        }
+        Other(err: Box<StdError + Send + Sync>) {
             description(err.description())
             display("{}", err)
             from()
@@ -107,21 +121,21 @@ impl From<String> for Error {
     }
 }
 
-impl From<Errors<macros::Error>> for Error {
-    fn from(mut errors: Errors<macros::Error>) -> Error {
+impl From<Errors<Spanned<macros::Error, BytePos>>> for Error {
+    fn from(mut errors: Errors<Spanned<macros::Error, BytePos>>) -> Error {
         if errors.len() == 1 {
             let err = errors.pop().unwrap();
-            match err.downcast::<Error>() {
+            match err.value.downcast::<Error>() {
                 Ok(err) => *err,
-                Err(err) => Error::Macro(err),
+                Err(err) => Error::Other(err),
             }
         } else {
             Error::Multiple(
                 errors
                     .into_iter()
-                    .map(|err| match err.downcast::<Error>() {
+                    .map(|err| match err.value.downcast::<Error>() {
                         Ok(err) => *err,
-                        Err(err) => Error::Macro(err),
+                        Err(err) => Error::Other(err),
                     })
                     .collect(),
             )
@@ -129,13 +143,20 @@ impl From<Errors<macros::Error>> for Error {
     }
 }
 
-
 impl From<Errors<Error>> for Error {
     fn from(mut errors: Errors<Error>) -> Error {
         if errors.len() == 1 {
             errors.pop().unwrap()
         } else {
-            Error::Multiple(errors.into())
+            errors = errors
+                .into_iter()
+                .flat_map(|err| match err {
+                    Error::Multiple(errors) => Either::Left(errors.into_iter()),
+                    err => Either::Right(Some(err).into_iter()),
+                })
+                .collect();
+
+            Error::Multiple(errors)
         }
     }
 }
@@ -148,12 +169,27 @@ pub struct Compiler {
     symbols: Symbols,
     implicit_prelude: bool,
     emit_debug_info: bool,
+    run_io: bool,
 }
 
 impl Default for Compiler {
     fn default() -> Compiler {
         Compiler::new()
     }
+}
+
+macro_rules! option {
+    ($(#[$attr:meta])* $name: ident $set_name: ident : $typ: ty) => {
+        $(#[$attr])*
+        pub fn $name(mut self, $name: $typ) -> Self {
+            self.$name = $name;
+            self
+        }
+
+        pub fn $set_name(&mut self, $name: $typ) {
+            self.$name = $name;
+        }
+    };
 }
 
 impl Compiler {
@@ -163,22 +199,27 @@ impl Compiler {
             symbols: Symbols::new(),
             implicit_prelude: true,
             emit_debug_info: true,
+            run_io: false,
         }
     }
 
-    /// Sets whether the implicit prelude should be include when compiling a file using this
-    /// compiler (default: true)
-    pub fn implicit_prelude(mut self, implicit_prelude: bool) -> Compiler {
-        self.implicit_prelude = implicit_prelude;
-        self
+    option!{
+        /// Sets whether the implicit prelude should be include when compiling a file using this
+        /// compiler (default: true)
+        implicit_prelude set_implicit_prelude: bool
     }
 
-    /// Sets whether the compiler should emit debug information such as source maps and variable
-    /// names.
-    /// (default: true)
-    pub fn emit_debug_info(mut self, emit_debug_info: bool) -> Compiler {
-        self.emit_debug_info = emit_debug_info;
-        self
+    option!{
+        /// Sets whether the compiler should emit debug information such as source maps and variable
+        /// names.
+        /// (default: true)
+        emit_debug_info set_emit_debug_info: bool
+    }
+
+    option!{
+        /// Sets whether `IO` expressions are evaluated.
+        /// (default: false)
+        run_io set_run_io: bool
     }
 
     pub fn mut_symbols(&mut self) -> &mut Symbols {
@@ -207,9 +248,7 @@ impl Compiler {
             &mut SymbolModule::new(file.into(), &mut self.symbols),
             type_cache,
             expr_str,
-        ).map_err(
-            |(expr, err)| (expr, InFile::new(file, expr_str, err)),
-        )?)
+        ).map_err(|(expr, err)| (expr, InFile::new(file, expr_str, err)))?)
     }
 
     /// Parse and typecheck `expr_str` returning the typechecked expression and type of the
@@ -244,12 +283,12 @@ impl Compiler {
         filename: &str,
         expr_str: &str,
         expr: &SpannedExpr<Symbol>,
-    ) -> Result<CompiledFunction> {
+    ) -> Result<CompiledModule> {
         TypecheckValue {
             expr: expr,
             typ: vm.global_env().type_cache().hole(),
         }.compile(self, vm, filename, expr_str, ())
-            .map(|result| result.function)
+            .map(|result| result.module)
     }
 
     /// Compiles the source code `expr_str` into bytecode serialized using `serializer`
@@ -328,34 +367,30 @@ impl Compiler {
         vm: &'vm Thread,
         filename: &str,
     ) -> BoxFutureValue<'vm, (), Error> {
-        use std::borrow::Cow;
-        use std::fs::File;
-        use std::io::Read;
+        use macros::MacroExpander;
 
-        let result = (|| -> Result<_> {
-            // Use the import macro's path resolution if it exists so that we mimick the import
-            // macro as close as possible
-            let opt_macro = vm.get_macros().get("import");
-            match opt_macro
-                .as_ref()
-                .and_then(|mac| mac.downcast_ref::<Import>())
-            {
-                Some(import) => Ok(import.read_file(filename)?),
-                None => {
-                    let mut buffer = StdString::new();
-                    {
-                        let mut file = File::open(filename)?;
-                        file.read_to_string(&mut buffer)?;
-                    }
-                    Ok(Cow::Owned(buffer))
-                }
+        // Use the import macro's path resolution if it exists so that we mimick the import
+        // macro as close as possible
+        let opt_macro = vm.get_macros().get("import");
+        let owned_import;
+        let import = match opt_macro
+            .as_ref()
+            .and_then(|mac| mac.downcast_ref::<Import>())
+        {
+            Some(import) => import,
+            None => {
+                owned_import = Import::new(DefaultImporter);
+                &owned_import
             }
-        })();
-        let name = filename_to_module(filename);
-        match result {
-            Ok(buffer) => self.load_script_async(vm, &name, &buffer),
-            Err(err) => FutureValue::Value(Err(err)),
-        }
+        };
+        let module_name = Symbol::from(format!("@{}", filename_to_module(filename)));
+        let mut macros = MacroExpander::new(vm);
+        if let Err((_, err)) =
+            import.load_module(self, vm, &mut macros, &module_name, Span::default())
+        {
+            macros.errors.push(pos::spanned(Span::default(), err));
+        };
+        FutureValue::from(macros.finish().map_err(|err| err.into())).boxed()
     }
 
     /// Compiles and runs the expression in `expr_str`. If successful the value from running the
@@ -429,54 +464,11 @@ impl Compiler {
         let expected = T::make_type(vm);
         expr_str
             .run_expr(self, vm, name, expr_str, Some(&expected))
-            .and_then(move |v| {
-                let ExecuteValue {
-                    typ: actual, value, ..
-                } = v;
-                unsafe {
-                    FutureValue::sync(match T::from_value(vm, Variants::new(&value)) {
-                        Some(value) => Ok((value, actual)),
-                        None => Err(Error::from(VmError::WrongType(expected, actual))),
-                    })
-                }
-            })
-            .boxed()
-    }
-
-    /// Compiles and runs `expr_str`. If the expression is of type `IO a` the action is evaluated
-    /// and a value of type `a` is returned
-    pub fn run_io_expr<'vm, T>(
-        &mut self,
-        vm: &'vm Thread,
-        name: &str,
-        expr_str: &str,
-    ) -> Result<(T, ArcType)>
-    where
-        T: Getable<'vm> + VmType + Send + 'vm,
-        T::Type: Sized,
-    {
-        self.run_io_expr_async(vm, name, expr_str).wait()
-    }
-
-    pub fn run_io_expr_async<'vm, T>(
-        &mut self,
-        vm: &'vm Thread,
-        name: &str,
-        expr_str: &str,
-    ) -> BoxFutureValue<'vm, (T, ArcType), Error>
-    where
-        T: Getable<'vm> + VmType + Send + 'vm,
-        T::Type: Sized,
-    {
-        let expected = T::make_type(vm);
-        expr_str
-            .run_expr(self, vm, name, expr_str, Some(&expected))
-            .and_then(move |v| run_io(vm, v))
-            .and_then(move |(value, actual)| unsafe {
-                FutureValue::sync(match T::from_value(vm, Variants::new(&value)) {
-                    Some(value) => Ok((value, actual)),
-                    None => Err(Error::from(VmError::WrongType(expected, actual))),
-                })
+            .and_then(move |execute_value| unsafe {
+                FutureValue::sync(Ok((
+                    T::from_value(vm, Variants::new(&execute_value.value.get_value())),
+                    execute_value.typ,
+                )))
             })
             .boxed()
     }
@@ -501,7 +493,7 @@ impl Compiler {
         use base::pos::UNKNOWN_EXPANSION;
         struct ExpandedSpans;
 
-        impl MutVisitor for ExpandedSpans {
+        impl<'a> MutVisitor<'a> for ExpandedSpans {
             type Ident = Symbol;
 
             fn visit_expr(&mut self, e: &mut SpannedExpr<Self::Ident>) {
@@ -530,64 +522,132 @@ impl Compiler {
 }
 
 pub const PRELUDE: &'static str = r#"
-let __implicit_prelude = import! "std/prelude.glu"
-and { Num, Eq, Ord, Show, Functor, Monad } = __implicit_prelude
-and { not } = import! "std/bool.glu"
+let __implicit_prelude = import! std.prelude
+and { Num, Eq, Ord, Show, Functor, Applicative, Monad, ? } = __implicit_prelude
+and { Bool, not, ? } = import! std.bool
+and { Option, ? } = import! std.option
 
-let __implicit_float = import! "std/float.glu"
-let { (+), (-), (*), (/) } = __implicit_float.num
-and { (==) } = __implicit_float.eq
-and { (<), (<=), (>=), (>) } = __implicit_prelude.make_Ord __implicit_float.ord
+let { (+), (-), (*), (/), (==), (/=), (<), (<=), (>=), (>), show, ? } = __implicit_prelude
 
-let __implicit_int = import! "std/int.glu"
-let { (+), (-), (*), (/) } = __implicit_int.num
-and { (==) } = __implicit_int.eq
-and { (<), (<=), (>=), (>) } = __implicit_prelude.make_Ord __implicit_int.ord
+let __implicit_float @ { ? } = import! std.float
 
-let __implicit_string = import! "std/string.glu"
-and { eq = { (==) } } = __implicit_string
-and { (<), (<=), (>=), (>) } = __implicit_prelude.make_Ord __implicit_string.ord
 
-in 0
+let __implicit_int @ { ? } = import! std.int
+
+let __implicit_string @ { ? } = import! std.string
+
+let { error } = import! std.prim
+
+in ()
 "#;
 
-pub fn filename_to_module(filename: &str) -> StdString {
-    use std::path::Path;
-    let path = Path::new(filename);
-    let name = path.extension().map_or(filename, |ext| {
-        ext.to_str()
-            .map(|ext| &filename[..filename.len() - ext.len() - 1])
-            .unwrap_or(filename)
-    });
+#[derive(Default)]
+pub struct VmBuilder {
+    #[cfg(not(target_arch = "wasm32"))]
+    event_loop: Option<::tokio_core::reactor::Remote>,
+    import_paths: Option<Vec<PathBuf>>,
+}
 
-    name.replace(|c: char| c == '/' || c == '\\', ".")
+impl VmBuilder {
+    pub fn new() -> VmBuilder {
+        VmBuilder::default()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    option!{
+        /// Sets then event loop which threads are run on
+        /// (default: None)
+        event_loop set_event_loop: Option<::tokio_core::reactor::Remote>
+    }
+
+    option!{
+        /// Sets then event loop which threads are run on
+        /// (default: ["."])
+        import_paths set_import_paths: Option<Vec<PathBuf>>
+    }
+
+    pub fn build(self) -> RootedThread {
+        #[cfg(target_arch = "wasm32")]
+        let vm = RootedThread::new();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let vm = RootedThread::with_global_state(
+            ::vm::vm::GlobalVmStateBuilder::new()
+                .event_loop(self.event_loop)
+                .build(),
+        );
+
+        let import = Import::new(DefaultImporter);
+        if let Some(import_paths) = self.import_paths {
+            import.set_paths(import_paths);
+        }
+
+        if let Ok(gluon_path) = env::var("GLUON_PATH") {
+            import.add_path(gluon_path);
+        }
+        vm.get_macros().insert(String::from("import"), import);
+
+        Compiler::new()
+            .implicit_prelude(false)
+            .run_expr_async::<OpaqueValue<&Thread, Hole>>(&vm, "", r#" import! std.types "#)
+            .sync_or_error()
+            .unwrap_or_else(|err| panic!("{}", err));
+
+        add_extern_module(&vm, "std.prim", ::vm::primitives::load);
+        add_extern_module(&vm, "std.byte.prim", ::vm::primitives::load_byte);
+        add_extern_module(&vm, "std.int.prim", ::vm::primitives::load_int);
+        add_extern_module(&vm, "std.float.prim", ::vm::primitives::load_float);
+        add_extern_module(&vm, "std.string.prim", ::vm::primitives::load_string);
+        add_extern_module(&vm, "std.char.prim", ::vm::primitives::load_char);
+        add_extern_module(&vm, "std.array.prim", ::vm::primitives::load_array);
+
+        add_extern_module(&vm, "std.lazy", ::vm::lazy::load);
+        add_extern_module(&vm, "std.reference", ::vm::reference::load);
+
+        add_extern_module(&vm, "std.channel", ::vm::channel::load_channel);
+        add_extern_module(&vm, "std.thread.prim", ::vm::channel::load_thread);
+        add_extern_module(&vm, "std.debug", ::vm::debug::load);
+        add_extern_module(&vm, "std.io.prim", ::io::load);
+
+        load_regex(&vm);
+        load_random(&vm);
+
+        vm
+    }
 }
 
 /// Creates a new virtual machine with support for importing other modules and with all primitives
 /// loaded.
 pub fn new_vm() -> RootedThread {
-    let vm = RootedThread::new();
-    let gluon_path = env::var("GLUON_PATH").unwrap_or_else(|_| String::from("."));
-    let import = Import::new(DefaultImporter);
-    import.add_path(gluon_path);
-    vm.get_macros().insert(String::from("import"), import);
-
-    Compiler::new()
-        .implicit_prelude(false)
-        .run_expr_async::<OpaqueValue<&Thread, Hole>>(&vm, "", r#" import! "std/types.glu" "#)
-        .sync_or_error()
-        .unwrap();
-    ::vm::primitives::load(&vm).expect("Loaded primitives library");
-    ::vm::channel::load(&vm).expect("Loaded channel library");
-    ::vm::debug::load(&vm).expect("Loaded debug library");
-    ::io::load(&vm).expect("Loaded IO library");
-    load_regex(&vm);
-    vm
+    VmBuilder::default().build()
 }
 
 #[cfg(feature = "regex")]
 fn load_regex(vm: &Thread) {
-    ::regex_bind::load(&vm).expect("Loaded regex library");
+    add_extern_module(&vm, "std.regex", ::regex_bind::load);
 }
 #[cfg(not(feature = "regex"))]
 fn load_regex(_: &Thread) {}
+
+#[cfg(all(feature = "rand", not(target_arch = "wasm32")))]
+fn load_random(vm: &Thread) {
+    add_extern_module(&vm, "std.random.prim", ::rand_bind::load);
+}
+#[cfg(any(not(feature = "rand"), target_arch = "wasm32"))]
+fn load_random(_: &Thread) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implicit_prelude() {
+        let _ = ::env_logger::try_init();
+
+        let thread = new_vm();
+        Compiler::new()
+            .implicit_prelude(false)
+            .run_expr::<()>(&thread, "prelude", PRELUDE)
+            .unwrap_or_else(|err| panic!("{}", err));
+    }
+}

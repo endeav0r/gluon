@@ -1,11 +1,13 @@
 #![allow(unused)]
 
-use base::ast::{Alternative, Array, AstType, DisplayEnv, Expr, ExprField, IdentEnv, Lambda,
-                Literal, Pattern, SpannedExpr, TypeBinding, TypedIdent, ValueBinding};
+use base::ast::{walk_mut_alias, walk_mut_ast_type, walk_mut_expr, walk_mut_pattern, Alternative,
+                Argument, Array, AstType, DisplayEnv, Expr, ExprField, IdentEnv, Lambda, Literal,
+                MutVisitor, Pattern, SpannedAlias, SpannedAstType, SpannedExpr, SpannedIdent,
+                SpannedPattern, TypeBinding, TypedIdent, ValueBinding};
 use base::error::Errors;
 use base::pos::{self, BytePos, Span, Spanned};
 use base::kind::Kind;
-use base::types::{AliasData, ArcType, Field, Generic, Type};
+use base::types::{Alias, AliasData, ArcType, Field, Generic, Type};
 use parser::{parse_string, Error, ParseErrors};
 use std::marker::PhantomData;
 
@@ -34,17 +36,66 @@ where
     }
 }
 
+/// MutVisitor that clears spans.
+pub struct NoSpan;
+
+impl<'a> MutVisitor<'a> for NoSpan {
+    type Ident = String;
+
+    fn visit_expr(&mut self, e: &mut SpannedExpr<Self::Ident>) {
+        e.span = Span::default();
+        walk_mut_expr(self, e);
+    }
+
+    fn visit_pattern(&mut self, p: &mut SpannedPattern<Self::Ident>) {
+        p.span = Span::default();
+        walk_mut_pattern(self, &mut p.value);
+    }
+
+    fn visit_spanned_typed_ident(&mut self, id: &mut SpannedIdent<Self::Ident>) {
+        id.span = Span::default();
+        self.visit_ident(&mut id.value)
+    }
+
+    fn visit_alias(&mut self, alias: &mut SpannedAlias<Self::Ident>) {
+        alias.span = Span::default();
+        walk_mut_alias(self, alias);
+    }
+
+    fn visit_spanned_ident(&mut self, s: &mut Spanned<Self::Ident, BytePos>) {
+        s.span = Span::default();
+    }
+
+    fn visit_ast_type(&mut self, s: &mut SpannedAstType<Self::Ident>) {
+        s.span = Span::default();
+        walk_mut_ast_type(self, s);
+    }
+}
+
 pub fn parse(
     input: &str,
 ) -> Result<SpannedExpr<String>, (Option<SpannedExpr<String>>, ParseErrors)> {
     parse_string(&mut MockEnv::new(), input)
 }
 
+/// Clears spans of the expression.
+pub fn clear_span(mut expr: SpannedExpr<String>) -> SpannedExpr<String> {
+    use support::NoSpan;
+    NoSpan.visit_expr(&mut expr);
+    expr
+}
+
 macro_rules! parse_new {
     ($input:expr) => {{
-        // Replace windows line endings so that byte positins match up on multiline expressions
+        // Replace windows line endings so that byte positions match up on multiline expressions
         let input = $input.replace("\r\n", "\n");
-        parse(&input).unwrap_or_else(|(_, err)| panic!("{}", err))
+        parse(&input).unwrap_or_else(|(_, err)| panic!("{}", ::base::error::InFile::new("test", &input, err)))
+    }}
+}
+
+macro_rules! parse_clear_span {
+    ($input:expr) => {{
+        clear_span(parse_new!($input))
     }}
 }
 
@@ -59,11 +110,12 @@ pub fn no_loc<T>(value: T) -> Spanned<T, BytePos> {
 }
 
 pub fn binop(l: SpExpr, s: &str, r: SpExpr) -> SpExpr {
-    no_loc(Expr::Infix(
-        Box::new(l),
-        no_loc(TypedIdent::new(intern(s))),
-        Box::new(r),
-    ))
+    no_loc(Expr::Infix {
+        lhs: Box::new(l),
+        op: no_loc(TypedIdent::new(intern(s))),
+        rhs: Box::new(r),
+        implicit_args: Vec::new(),
+    })
 }
 
 pub fn int(i: i64) -> SpExpr {
@@ -83,7 +135,7 @@ pub fn let_a(s: &str, args: &[&str], e: SpExpr, b: SpExpr) -> SpExpr {
                 typ: None,
                 resolved_type: Type::hole(),
                 args: args.iter()
-                    .map(|i| no_loc(TypedIdent::new(intern(i))))
+                    .map(|i| Argument::explicit(no_loc(TypedIdent::new(intern(i)))))
                     .collect(),
                 expr: e,
             },
@@ -114,7 +166,11 @@ pub fn generic(s: &str) -> Generic<String> {
 }
 
 pub fn app(e: SpExpr, args: Vec<SpExpr>) -> SpExpr {
-    no_loc(Expr::App(Box::new(e), args))
+    no_loc(Expr::App {
+        func: Box::new(e),
+        implicit_args: Vec::new(),
+        args,
+    })
 }
 
 pub fn if_else(p: SpExpr, if_true: SpExpr, if_false: SpExpr) -> SpExpr {
@@ -129,11 +185,9 @@ pub fn case(e: SpExpr, alts: Vec<(Pattern<String>, SpExpr)>) -> SpExpr {
     no_loc(Expr::Match(
         Box::new(e),
         alts.into_iter()
-            .map(|(p, e)| {
-                Alternative {
-                    pattern: no_loc(p),
-                    expr: e,
-                }
+            .map(|(p, e)| Alternative {
+                pattern: no_loc(p),
+                expr: e,
             })
             .collect(),
     ))
@@ -143,7 +197,7 @@ pub fn lambda(name: &str, args: Vec<String>, body: SpExpr) -> SpExpr {
     no_loc(Expr::Lambda(Lambda {
         id: TypedIdent::new(intern(name)),
         args: args.into_iter()
-            .map(|id| no_loc(TypedIdent::new(id)))
+            .map(|id| Argument::explicit(no_loc(TypedIdent::new(id))))
             .collect(),
         body: Box::new(body),
     }))
@@ -160,7 +214,7 @@ pub fn type_decl(
             TypeBinding {
                 comment: None,
                 name: no_loc(name.clone()),
-                alias: alias(name, args, typ),
+                alias: no_loc(AliasData::new(name, args, typ)),
                 finalized_alias: None,
             },
         ],
@@ -184,24 +238,21 @@ pub fn record_a(
         typ: Type::hole(),
         types: types
             .into_iter()
-            .map(|(name, value)| {
-                ExprField {
-                    comment: None,
-                    name: no_loc(name),
-                    value: value,
-                }
+            .map(|(name, value)| ExprField {
+                comment: None,
+                name: no_loc(name),
+                value: value,
             })
             .collect(),
         exprs: fields
             .into_iter()
-            .map(|(name, value)| {
-                ExprField {
-                    comment: None,
-                    name: no_loc(name),
-                    value: value,
-                }
+            .map(|(name, value)| ExprField {
+                comment: None,
+                name: no_loc(name),
+                value: value,
             })
             .collect(),
+        base: None,
     })
 }
 
@@ -221,7 +272,7 @@ pub fn array(fields: Vec<SpExpr>) -> SpExpr {
 }
 
 pub fn error() -> SpExpr {
-    no_loc(Expr::Error)
+    no_loc(Expr::Error(None))
 }
 
 pub fn alias<Id>(

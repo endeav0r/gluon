@@ -1,25 +1,22 @@
-let prelude = import! "std/prelude.glu"
-let { run, writer, assert_eq, assert_ieq } = import! "std/test.glu"
-let int = import! "std/int.glu"
-let stream  = import! "std/stream.glu"
-let { Ord, Num } = prelude
-let { (<) } = prelude.make_Ord int.ord
-let { (+) } = int.num
-let { (*>) } = prelude.make_Applicative writer.applicative
-let list = import! "std/list.glu"
-let { List } = list
-let { Option } = import! "std/option.glu"
+let prelude = import! std.prelude
+let { (<|) } = import! std.function
+let { run, Test, assert_eq, test, group, ? } = import! std.test
+let { Applicative, (*>) } = import! std.applicative
+let int = import! std.int
+let stream @ { Stream } = import! std.stream
+let list @ { List, ? } = import! std.list
+let { Option } = import! std.option
 
 let s = stream.from (\i -> if i < 5 then Some i else None)
 
-let assert_leq s a =
+let assert_leq s a : Stream Int -> Array Int -> _ =
     assert_eq
-        (list.show int.show)
-        (list.eq int.eq)
         (stream.to_list s)
         (list.of a)
 
-assert_ieq (stream.fold (+) 0 s) 10
-    *> assert_leq s [4, 3, 2, 1, 0]
-    *> assert_leq (stream.functor.map (\x -> x + x) s) [8, 6, 4, 2, 0]
-    *> assert_leq (stream.zip_with (+) s s) [8, 6, 4, 2, 0]
+group "stream" [
+    test "fold" <| \_ -> (assert_eq (stream.fold (+) 0 s) 10),
+    test "from" <| \_ -> (assert_leq s [4, 3, 2, 1, 0]),
+    test "map" <| \_ -> (assert_leq (stream.functor.map (\x -> x + x) s) [8, 6, 4, 2, 0]),
+    test "zip_with" <| \_ -> (assert_leq (stream.zip_with (+) s s) [8, 6, 4, 2, 0])
+]

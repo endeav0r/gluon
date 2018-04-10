@@ -1,11 +1,11 @@
-let prelude = import! "std/prelude.glu"
+let prelude = import! std.prelude
 let { Expr } = import! "examples/lisp/types.glu"
-let char = import! "std/char.glu"
-let { List } = import! "std/list.glu"
-let { Result } = import! "std/result.glu"
-let string = import! "std/string.glu"
-let float = import! "std/float.glu"
-let int = import! "std/int.glu"
+let char = import! std.char
+let { List } = import! std.list
+let { Result } = import! std.result
+let string = import! std.string
+let float = import! std.float
+let int = import! std.int
 
 let {
     Parser,
@@ -21,18 +21,19 @@ let {
     satisfy,
     spaces,
     token,
-    take_string,
+    recognize,
     take1,
     skip_many,
-    skip_many1
+    skip_many1,
+    ?
 } =
-    import! "std/parser.glu"
+    import! std.parser
 
-let { (<>) } = prelude.make_Semigroup string.semigroup
+let { (<>) } =import! std.prelude
 
-let { (<*), (*>), map2, wrap } = prelude.make_Applicative applicative
-let { (<|>) } = prelude.make_Alternative alternative
-let { (>>=) } = prelude.make_Monad monad
+let { Applicative, (<*), (*>), map2, wrap } = import! std.applicative
+let { (<|>) } = import! std.applicative
+let { flat_map } = import! std.monad
 
 let atom : Parser Expr =
     let symbol = one_of "!#$%&|*+-/:<=>?@^_~"
@@ -40,14 +41,13 @@ let atom : Parser Expr =
     let alpha_num = satisfy char.is_alphanumeric
     functor.map
         (\x -> Atom x)
-        (take_string ((alpha <|> symbol) *> skip_many (alpha_num <|> symbol)))
+        (recognize ((alpha <|> symbol) *> skip_many (alpha_num <|> symbol)))
 
 let parse_parser p f msg : Parser a -> (String -> Result () b) -> String -> Parser b =
-    take_string p
-        >>= (\s ->
-        match f s with
-        | Ok i -> wrap i
-        | Err _ -> fail ("Expected " <> msg))
+    do s = recognize p
+    match f s with
+    | Ok i -> wrap i
+    | Err _ -> fail ("Expected " <> msg)
 
 let int_parser : Parser Expr =
     functor.map

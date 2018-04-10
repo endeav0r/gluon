@@ -1,4 +1,7 @@
 extern crate env_logger;
+#[macro_use]
+extern crate pretty_assertions;
+
 extern crate gluon;
 extern crate gluon_completion as completion;
 
@@ -10,14 +13,11 @@ use support::*;
 use gluon::base::pos::BytePos;
 use gluon::base::types::Type;
 use gluon::base::source;
-use gluon::vm::api::{FunctionRef, Hole, OpaqueValue, ValueRef, IO};
-use gluon::vm::thread::{Thread, ThreadInternal};
+use gluon::vm::api::{FunctionRef, Hole, OpaqueValue, ValueRef};
+use gluon::vm::thread::{RootedThread, Thread, ThreadInternal};
 use gluon::vm::internal::Value;
-use gluon::vm::internal::Value::{Float, Int};
-use gluon::vm::stack::{StackFrame, State};
 use gluon::vm::channel::Sender;
 use gluon::{Compiler, Error};
-
 
 test_expr!{ pass_function_value,
 r"
@@ -57,23 +57,28 @@ r" 120.0 #Float/ 4.0
 
 #[test]
 fn record() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r"
 { x = 0, y = 1.0, z = {} }
 ";
     let vm = make_vm();
     let value = run_expr::<OpaqueValue<&Thread, Hole>>(&vm, text);
-    assert_eq!(
-        value.get_ref(),
-        vm.context()
-            .new_record(&vm, 0, &mut [Int(0), Float(1.0), Value::Tag(0)])
-            .unwrap()
-    );
+    match value.get_ref() {
+        ValueRef::Data(data) => {
+            assert_eq!(data.get(0).unwrap(), ValueRef::Int(0));
+            assert_eq!(data.get(1).unwrap(), ValueRef::Float(1.0));
+            match data.get(2).unwrap() {
+                ValueRef::Data(data) if data.tag() == 0 => (),
+                _ => panic!(),
+            }
+        }
+        _ => panic!(),
+    }
 }
 
 #[test]
 fn add_record() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r"
 type T = { x: Int, y: Int } in
 let add = \l r -> { x = l.x #Int+ r.x, y = l.y #Int+ r.y } in
@@ -81,16 +86,17 @@ add { x = 0, y = 1 } { x = 1, y = 1 }
 ";
     let vm = make_vm();
     let value = run_expr::<OpaqueValue<&Thread, Hole>>(&vm, text);
-    assert_eq!(
-        value.get_ref(),
-        vm.context()
-            .new_record(&vm, 0, &mut [Int(1), Int(2)])
-            .unwrap()
-    );
+    match value.get_ref() {
+        ValueRef::Data(data) => {
+            assert_eq!(data.get(0).unwrap(), ValueRef::Int(1));
+            assert_eq!(data.get(1).unwrap(), ValueRef::Int(2));
+        }
+        _ => panic!(),
+    }
 }
 #[test]
 fn script() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r"
 type T = { x: Int, y: Int } in
 let add l r = { x = l.x #Int+ r.x, y = l.y #Int+ r.y } in
@@ -115,19 +121,18 @@ in add { x = 10, y = 5 } { x = 1, y = 2 }
 }
 #[test]
 fn adt() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r"
 type Option a = | None | Some a
 in Some 1
 ";
     let vm = make_vm();
     let value = run_expr::<OpaqueValue<&Thread, Hole>>(&vm, text);
-    assert_eq!(
-        value.get_ref(),
-        vm.context().new_data(&vm, 1, &mut [Int(1)]).unwrap()
-    );
+    match value.get_ref() {
+        ValueRef::Data(ref data) if data.tag() == 1 && data.get(0) == Some(ValueRef::Int(1)) => (),
+        _ => panic!("{:?}", value),
+    }
 }
-
 
 test_expr!{ recursive_function,
 r"
@@ -158,28 +163,6 @@ in f 4
 ",
 2i32
 }
-
-#[test]
-fn insert_stack_slice() {
-    let _ = ::env_logger::init();
-    let vm = make_vm();
-    let mut context = vm.context();
-    let mut stack = StackFrame::current(&mut context.stack);
-    stack.push(Int(0));
-    stack.insert_slice(0, &[Int(2), Int(1)]);
-    assert_eq!(&stack[..], [Int(2), Int(1), Int(0)]);
-    stack.enter_scope(2, State::Unknown);
-    stack.insert_slice(1, &[Int(10)]);
-    assert_eq!(&stack[..], [Int(1), Int(10), Int(0)]);
-    stack.insert_slice(1, &[]);
-    assert_eq!(&stack[..], [Int(1), Int(10), Int(0)]);
-    stack.insert_slice(2, &[Int(4), Int(5), Int(6)]);
-    assert_eq!(
-        &stack[..],
-        [Int(1), Int(10), Int(4), Int(5), Int(6), Int(0)]
-    );
-}
-
 
 test_expr!{ primitive_char_eq,
 r"
@@ -213,6 +196,29 @@ true
 test_expr!{ primitive_byte_lt,
 r"
 100b #Byte< 100b
+",
+false
+}
+
+test_expr!{ prelude overloaded_compare_int,
+r"
+99 < 100
+",
+true
+}
+
+test_expr!{ prelude overloaded_compare_float,
+r"
+99.0 < 100.0
+",
+true
+}
+
+test_expr!{ implicit_call_without_type_in_scope,
+r"
+let int @ { ? } = import! std.int
+let prelude @ { (==) } = import! std.prelude
+99 == 100
 ",
 false
 }
@@ -262,14 +268,6 @@ let f a b c = c
 4i32
 }
 
-test_expr!{ no_io_eval,
-r#"
-let io = import! "std/io.glu"
-let x = io_flat_map (\x -> error "NOOOOOOOO") (io.println "1")
-in { x }
-"#
-}
-
 test_expr!{ char,
 r#"
 'a'
@@ -277,108 +275,45 @@ r#"
 'a'
 }
 
+test_expr!{ prelude handle_fields_being_ignored_in_optimize,
+    r#"
+let large_record = { x = 1, y = 2 }
+large_record.x
+"#,
+1
+}
+
 test_expr!{ any zero_argument_variant_is_int,
 r#"
 type Test = | A Int | B
 B
 "#,
-Value::Tag(1)
-}
-
-test_expr!{ match_on_zero_argument_variant,
-r#"
-type Test = | A Int | B
-match B with
-| A x -> x
-| B -> 0
-"#,
-0i32
+Value::tag(1)
 }
 
 test_expr!{ any marshalled_option_none_is_int,
 r#"
+let string_prim = import! std.string.prim
 string_prim.find "a" "b"
 "#,
-Value::Tag(0)
+Value::tag(0)
 }
 
 test_expr!{ any marshalled_ordering_is_int,
 r#"
-string_prim.compare "a" "b"
+let { string_compare } = import! std.prim
+string_compare "a" "b"
 "#,
-Value::Tag(0)
+Value::tag(0)
 }
 
-test_expr!{ prelude match_on_bool,
+test_expr!{ discriminant_value,
 r#"
-let { Bool } = import! "std/bool.glu"
-match True with
-| False -> 10
-| True -> 11
+type Variant a = | A | B Int | C String
+let prim = import! std.prim
+prim.discriminant_value (C "")
 "#,
-11i32
-}
-
-#[test]
-fn non_exhaustive_pattern() {
-    let _ = ::env_logger::init();
-    let text = r"
-type AB = | A | B in
-match A with
-| B -> True
-";
-    let mut vm = make_vm();
-    let result = Compiler::new()
-        .run_expr_async::<bool>(&mut vm, "<top>", text)
-        .sync_or_error();
-    assert!(result.is_err());
-}
-
-test_expr!{ match_record_pattern,
-r#"
-match { x = 1, y = "abc" } with
-| { x, y = z } -> x #Int+ string_prim.len z
-"#,
-4i32
-}
-
-test_expr!{ match_stack,
-r#"
-1 #Int+ (match string_prim with
-         | { len } -> len "abc")
-"#,
-4i32
-}
-
-test_expr!{ let_record_pattern,
-r#"
-let (+) x y = x #Int+ y
-in
-let a = { x = 10, y = "abc" }
-in
-let {x, y = z} = a
-in x + string_prim.len z
-"#,
-13i32
-}
-
-test_expr!{ partial_record_pattern,
-r#"
-type A = { x: Int, y: Float } in
-let x = { x = 1, y = 2.0 }
-in match x with
-| { y } -> y
-"#,
-2.0f64
-}
-
-test_expr!{ record_let_adjust,
-r#"
-let x = \z -> let { x, y } = { x = 1, y = 2 } in z in
-let a = 3
-in a
-"#,
-3i32
+2
 }
 
 test_expr!{ unit_expr,
@@ -411,76 +346,16 @@ in (id { x = 1 }).x
 }
 
 test_expr!{ module_function,
-r#"let x = string_prim.len "test" in x"#,
+r#"
+let string_prim = import! std.string.prim
+let x = string_prim.len "test" in x
+"#,
 4i32
-}
-
-test_expr!{ io_print,
-r#"
-let io = import! "std/io.glu"
-io.print "123"
-"#
-}
-
-test_expr!{ array,
-r#"
-let arr = [1,2,3]
-
-array.index arr 0 #Int== 1
-    && array.len arr #Int== 3
-    && array.len (array.append arr arr) #Int== array.len arr #Int* 2"#,
-true
-}
-
-test_expr!{ array_byte,
-r#"
-let arr = [1b,2b,3b]
-
-let b = array.index arr 2 #Byte== 3b && array.len arr #Int== 3
-let arr2 = array.append arr arr
-b && array.len arr2 #Int== array.len arr #Int* 2
-  && array.index arr2 1 #Byte== array.index arr2 4
-"#,
-true
-}
-
-test_expr!{ array_float,
-r#"
-let arr = [1.0,2.0,3.0]
-
-let b = array.index arr 2 #Float== 3.0 && array.len arr #Int== 3
-let arr2 = array.append arr arr
-b && array.len arr2 #Int== array.len arr #Int* 2
-  && array.index arr2 1 #Float== array.index arr2 4
-"#,
-true
-}
-
-test_expr!{ array_data,
-r#"
-let arr = [{x = 1, y = "a" }, { x = 2, y = "b" }]
-
-let b = (array.index arr 1).x #Int== 2 && array.len arr #Int== 2
-let arr2 = array.append arr arr
-b && array.len arr2 #Int== array.len arr #Int* 2
-"#,
-true
-}
-
-test_expr!{ array_array,
-r#"
-let arr = [[], [1], [2, 3]]
-
-let b = array.len (array.index arr 1) #Int== 1 && array.len arr #Int== 3
-let arr2 = array.append arr arr
-b && array.len arr2 #Int== array.len arr #Int* 2
-"#,
-true
 }
 
 test_expr!{ prelude true_branch_not_affected_by_false_branch,
 r#"
-let { Bool } = import! "std/bool.glu"
+let { Bool } = import! std.bool
 if True then
     let x = 1
     x
@@ -490,33 +365,9 @@ else
 1i32
 }
 
-test_expr!{ access_only_a_few_fields_from_large_record,
-r#"
-let record = { a = 0, b = 1, c = 2, d = 3, e = 4, f = 5, g = 6,
-               h = 7, i = 8, j = 9, k = 10, l = 11, m = 12 }
-let { a } = record
-let { i, m } = record
-
-a #Int+ i #Int+ m
-"#,
-20i32
-}
-
-// Without a slide instruction after the alternatives code this code would try to call `x 1`
-// instead of `id 1`
-test_expr!{ slide_down_case_alternative,
-r#"
-type Test = | Test Int
-let id x = x
-id (match Test 0 with
-    | Test x -> 1)
-"#,
-1i32
-}
-
 test_expr!{ prelude and_operator_stack,
 r#"
-let { Bool } = import! "std/bool.glu"
+let { Bool } = import! std.bool
 let b = True && True
 let b2 = False
 b
@@ -526,36 +377,12 @@ true
 
 test_expr!{ prelude or_operator_stack,
 r#"
-let { Bool } = import! "std/bool.glu"
+let { Bool } = import! std.bool
 let b = False || True
 let b2 = False
 b
 "#,
 true
-}
-
-// Test that empty variants are handled correctly in arrays
-test_expr!{ array_empty_variant,
-r#"
-type Test = | Empty | Some Int
-let arr = [Empty, Some 1]
-match array.index arr 0 with
-| Empty -> 0
-| Some x -> x
-"#,
-0i32
-}
-
-// Test that array append handles array types correctly
-test_expr!{ array_empty_append,
-r#"
-type Test = | Empty | Some Int
-let arr = array.append [] [Empty, Some 1]
-match array.index arr 0 with
-| Empty -> 0
-| Some x -> x
-"#,
-0i32
 }
 
 test_expr!{ overload_resolution_with_record_pattern,
@@ -569,128 +396,117 @@ f 0 (\r -> { x = r #Int+ 1 })
 1i32
 }
 
-test_expr!{ nested_pattern,
-r#"
-type Option a = | Some a | None
-match Some (Some 123) with
-| None -> 0
-| Some None -> 1
-| Some (Some x) -> x
-"#,
-123i32
-}
-
-test_expr!{ nested_pattern2,
-r#"
-type Option a = | Some a | None
-match Some None with
-| None -> 0
-| Some None -> 1
-| Some (Some x) -> x
-"#,
-1i32
-}
-
-test_expr!{ nested_record_pattern,
-r#"
-type Test a = | A a | B
-match { x = A 1 } with
-| { x = A y } -> y
-| { x = B } -> 100
-"#,
-1i32
-}
-
-test_expr!{ nested_record_pattern2,
-r#"
-type Test a = | A a | B
-match { x = B } with
-| { x = A y } -> y
-| { x = B } -> 100
-"#,
-100i32
-}
-
-
 #[test]
 fn overloaded_bindings() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r#"
-let (+) x y = x #Int+ y
-in
-let (+) x y = x #Float+ y
-in
-{ x = 1 + 2, y = 1.0 + 2.0 }
+/// @implicit
+let add_int x y = x #Int+ y
+/// @implicit
+let add_float x y = x #Float+ y
+
+let add ?f: [a -> a -> a] -> a -> a -> a = f
+
+{ x = add 1 2, y = add 1.0 2.0 }
 "#;
     let vm = make_vm();
     let result = run_expr::<OpaqueValue<&Thread, Hole>>(&vm, text);
-    assert_eq!(
-        result.get_ref(),
-        vm.context()
-            .new_record(&vm, 0, &mut [Int(3), Float(3.0)])
-            .unwrap()
-    );
-}
-
-test_expr!{ through_overloaded_alias,
-r#"
-type Test a = { id : a -> a }
-in
-let test_Int: Test Int = { id = \x -> 0 }
-in
-let test_String: Test String = { id = \x -> "" }
-in
-let { id } = test_Int
-in
-let { id } = test_String
-in id 1
-"#,
-0i32
-}
-
-#[test]
-fn run_expr_int() {
-    let _ = ::env_logger::init();
-
-    let text = r#"
-        let io = import! "std/io.glu"
-        io.run_expr "123"
-    "#;
-    let mut vm = make_vm();
-    let (result, _) = Compiler::new()
-        .run_io_expr_async::<IO<String>>(&mut vm, "<top>", text)
-        .sync_or_error()
-        .unwrap();
-    match result {
-        IO::Value(result) => {
-            let expected = "123 : Int";
-            assert_eq!(result, expected);
+    match result.get_ref() {
+        ValueRef::Data(data) => {
+            assert_eq!(data.get(0).unwrap(), ValueRef::Int(3));
+            assert_eq!(data.get(1).unwrap(), ValueRef::Float(3.0));
         }
-        IO::Exception(err) => panic!("{}", err),
+        _ => panic!(),
     }
 }
 
-test_expr!{ io run_expr_io,
+test_expr!{ record_base_duplicate_fields,
 r#"
-let io = import! "std/io.glu"
-io_flat_map (\x -> io_wrap 100)
-            (io.run_expr "
-                let io = import! \"std/io.glu\"
-                io.print \"123\"
-            ")
+{ x = "" ..  { x = 1 } }.x
 "#,
-100i32
+""
+}
+
+test_expr!{ record_base_duplicate_fields2,
+r#"
+{ x = "" ..  { x = 1, y = 2 } }.y
+"#,
+2
+}
+
+test_expr!{ prelude do_expression_option_some,
+r#"
+let { monad = { flat_map } } = import! std.option
+do x = Some 1
+Some (x + 2)
+"#,
+Some(3)
+}
+
+test_expr!{ prelude do_expression_option_none,
+r#"
+let { monad = { flat_map } } = import! std.option
+do x = None
+Some 1
+"#,
+None::<i32>
+}
+
+test_expr!{ function_with_implicit_argument_from_record,
+r#"
+let f ?t x: [Int] -> () -> Int = t
+let x @ { ? } =
+    /// @implicit
+    let test = 1
+    { test }
+f ()
+"#,
+1
+}
+
+test_expr!{ prelude not_equal_operator,
+r#"
+1 /= 2
+"#,
+true
+}
+
+test_expr!{ implicit_argument_selection1,
+r#"
+/// @implicit
+type Test = | Test ()
+let f y: [a] -> a -> () = ()
+let i = Test ()
+f (Test ())
+"#,
+()
+}
+
+test_expr!{ prelude implicit_argument_selection2,
+r#"
+let string = import! std.string
+let { append = (++) } = string.semigroup
+
+let equality l r : [Eq a] -> a -> a -> String =
+    if l == r then " == " else " != "
+
+let cmp l r : [Show a] -> [Eq a] -> a -> a -> String =
+    (show l) ++ (equality l r) ++ (show r)
+
+cmp 5 6
+"#,
+String::from("5 != 6")
 }
 
 #[test]
 fn rename_types_after_binding() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let text = r#"
-let list  = import! "std/list.glu"
+let list = import! std.list
 in
 let { List } = list
-and { (==) }: Eq (List Int) = list.eq { (==) }
+and eq_list: Eq (List Int) = list.eq
 in Cons 1 Nil == Nil
 "#;
     let mut vm = make_vm();
@@ -704,8 +520,28 @@ in Cons 1 Nil == Nil
 }
 
 #[test]
+fn record_splat_ice() {
+    let _ = ::env_logger::try_init();
+
+    let text = r#"
+let large_record = { x = 1 }
+{
+    field = 123,
+    ..
+    large_record
+}
+"#;
+    let mut vm = make_vm();
+    let result = Compiler::new()
+        .implicit_prelude(false)
+        .run_expr::<OpaqueValue<&Thread, Hole>>(&mut vm, "example", text);
+
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+}
+
+#[test]
 fn test_implicit_prelude() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r#"1.0 + 3.0 - 2.0"#;
     let mut vm = make_vm();
     Compiler::new()
@@ -716,7 +552,7 @@ fn test_implicit_prelude() {
 
 #[test]
 fn access_field_through_vm() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r#" { x = 0, inner = { y = 1.0 } } "#;
     let mut vm = make_vm();
     load_script(&mut vm, "test", text).unwrap_or_else(|err| panic!("{}", err));
@@ -728,14 +564,10 @@ fn access_field_through_vm() {
 
 #[test]
 fn access_operator_without_parentheses() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
     Compiler::new()
-        .run_expr_async::<OpaqueValue<&Thread, Hole>>(
-            &vm,
-            "example",
-            r#" import! "std/prelude.glu" "#,
-        )
+        .run_expr_async::<OpaqueValue<&Thread, Hole>>(&vm, "example", r#" import! std.prelude "#)
         .sync_or_error()
         .unwrap();
     let result: Result<FunctionRef<fn(i32, i32) -> i32>, _> =
@@ -745,7 +577,7 @@ fn access_operator_without_parentheses() {
 
 #[test]
 fn get_binding_with_alias_type() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r#"
         type Test = Int
         let x: Test = 0
@@ -759,29 +591,29 @@ fn get_binding_with_alias_type() {
 
 #[test]
 fn get_binding_with_generic_params() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let vm = make_vm();
-    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! "std/prelude.glu" "#);
-    let mut id: FunctionRef<fn(String) -> String> = vm.get_global("std.prelude.id")
+    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! std.function "#);
+    let mut id: FunctionRef<fn(String) -> String> = vm.get_global("std.function.id")
         .unwrap_or_else(|err| panic!("{}", err));
     assert_eq!(id.call("test".to_string()), Ok("test".to_string()));
 }
 
 #[test]
 fn test_prelude() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
-    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! "std/prelude.glu" "#);
+    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! std.prelude "#);
 }
 
 #[test]
 fn access_types_by_path() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let vm = make_vm();
-    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! "std/option.glu" "#);
-    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! "std/result.glu" "#);
+    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! std.option "#);
+    run_expr::<OpaqueValue<&Thread, Hole>>(&vm, r#" import! std.result "#);
 
     assert!(vm.find_type_info("std.option.Option").is_ok());
     assert!(vm.find_type_info("std.result.Result").is_ok());
@@ -794,8 +626,15 @@ fn access_types_by_path() {
 
 #[test]
 fn opaque_value_type_mismatch() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
+
+    Compiler::new()
+        .implicit_prelude(false)
+        .run_expr_async::<()>(&vm, "<top>", "let _ = import! std.channel in ()")
+        .sync_or_error()
+        .unwrap();
+
     let expr = r#"
 let { sender, receiver } = channel 0
 send sender 1
@@ -814,9 +653,9 @@ sender
 
 #[test]
 fn invalid_string_slice_dont_panic() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r#"
-let string = import! "std/string.glu"
+let string = import! std.string
 let s = "åäö"
 string.slice s 1 (string.len s)
 "#;
@@ -832,35 +671,14 @@ string.slice s 1 (string.len s)
 }
 
 #[test]
-fn dont_execute_io_in_run_expr_async() {
-    let _ = ::env_logger::init();
-    let vm = make_vm();
-    let expr = r#"
-let prelude  = import! "std/prelude.glu"
-let io = import! "std/io.glu"
-let { wrap } = io.applicative
-wrap 123
-"#;
-    let value = Compiler::new()
-        .run_expr_async::<OpaqueValue<&Thread, Hole>>(&vm, "example", expr)
-        .sync_or_error()
-        .unwrap_or_else(|err| panic!("{}", err));
-    assert!(
-        value.0.get_ref() != Value::Int(123),
-        "Unexpected {:?}",
-        value.0
-    );
-}
-
-#[test]
 fn partially_applied_constructor_is_lambda() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
 
     let result = Compiler::new().run_expr::<FunctionRef<fn(i32) -> Option<i32>>>(
         &vm,
         "test",
-        r#"let { Option } = import! "std/option.glu" in Some"#,
+        r#"let { Option } = import! std.option in Some"#,
     );
     assert!(result.is_ok(), "{}", result.err().unwrap());
     assert_eq!(result.unwrap().0.call(123), Ok(Some(123)));
@@ -869,7 +687,7 @@ fn partially_applied_constructor_is_lambda() {
 #[test]
 fn stacktrace() {
     use gluon::vm::stack::StacktraceFrame;
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let text = r#"
 let end _ = 1 + error "test"
 let f x =
@@ -890,6 +708,7 @@ g 10
             let g = stacktrace.frames[0].as_ref().unwrap().name.clone();
             let f = stacktrace.frames[1].as_ref().unwrap().name.clone();
             let end = stacktrace.frames[6].as_ref().unwrap().name.clone();
+            let error = stacktrace.frames[7].as_ref().unwrap().name.clone();
             assert_eq!(
                 stacktrace.frames,
                 vec![
@@ -923,6 +742,10 @@ g 10
                         name: end.clone(),
                         line: 1.into(),
                     }),
+                    Some(StacktraceFrame {
+                        name: error.clone(),
+                        line: 0.into(),
+                    }),
                 ]
             );
         }
@@ -932,13 +755,14 @@ g 10
 }
 #[test]
 fn completion_with_prelude() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
 
     let source = r#"
-let prelude  = import! "std/prelude.glu"
-and { Option } = import! "std/option.glu"
+let prelude  = import! std.prelude
+and { Option } = import! std.option
 and { Num } = prelude
+let { lazy } = import! std.lazy
 
 type Stream_ a =
     | Value a (Stream a)
@@ -965,14 +789,14 @@ let from f : (Int -> Option a) -> Stream a =
     let result = completion::find(
         &*vm.get_env(),
         &expr,
-        lines.offset(13.into(), 29.into()).unwrap(),
+        lines.offset(14.into(), 29.into()).unwrap(),
     );
     assert_eq!(result, Ok(Type::int()));
 }
 
 #[test]
 fn completion_with_prelude_at_0() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
 
     let expr = "1";
@@ -987,7 +811,7 @@ fn completion_with_prelude_at_0() {
 
 #[test]
 fn suggestion_from_implicit_prelude() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
 
     let expr = "1 ";
@@ -1004,7 +828,7 @@ fn suggestion_from_implicit_prelude() {
 /// `Source` from the normal expression
 #[test]
 fn dont_use_the_implicit_prelude_span_in_the_top_expr() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
     let vm = make_vm();
 
     let expr = "1";
@@ -1017,4 +841,48 @@ fn dont_use_the_implicit_prelude_span_in_the_top_expr() {
 #[test]
 fn value_size() {
     assert!(::std::mem::size_of::<Value>() <= 16);
+}
+
+#[test]
+fn deep_clone_partial_application() {
+    use gluon::base::symbol::Symbol;
+    use gluon::base::metadata::Metadata;
+
+    let _ = ::env_logger::try_init();
+    let vm = RootedThread::new();
+
+    assert_eq!(vm.context().gc.allocated_memory(), 0);
+
+    let child = vm.new_thread().unwrap();
+
+    assert_eq!(child.context().gc.allocated_memory(), 0);
+
+    let result = Compiler::new()
+        .implicit_prelude(false)
+        .run_expr::<OpaqueValue<&Thread, Hole>>(
+            &child,
+            "test",
+            r#"
+                let f x y = y
+                f 1
+            "#,
+        );
+    assert!(result.is_ok(), "{}", result.err().unwrap());
+
+    let global_memory_without_closures = vm.global_env().gc.lock().unwrap().allocated_memory();
+    let memory_for_closures = child.context().gc.allocated_memory();
+
+    vm.set_global(
+        Symbol::from("@test"),
+        Type::hole(),
+        Metadata::default(),
+        unsafe { result.unwrap().0.get_value() },
+    ).unwrap();
+
+    let global_memory_with_closures = vm.global_env().gc.lock().unwrap().allocated_memory();
+
+    assert_eq!(
+        global_memory_without_closures + memory_for_closures,
+        global_memory_with_closures
+    );
 }

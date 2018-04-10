@@ -106,7 +106,7 @@ impl Location {
     pub fn shift(mut self, ch: char) -> Location {
         if ch == '\n' {
             self.line += Line::from(1);
-            self.column = Column::from(0);
+            self.column = Column::from(1);
         } else {
             self.column += Column::from(1);
         }
@@ -121,7 +121,7 @@ impl fmt::Display for Location {
     }
 }
 
-/// An expansion identifier tracks wheter a span originated from a macro expansion or not
+/// An expansion identifier tracks whether a span originated from a macro expansion or not.
 #[derive(Copy, Clone, Default, Ord, PartialOrd, Eq, PartialEq, Debug)]
 pub struct ExpansionId(pub u32);
 
@@ -151,13 +151,13 @@ where
     Pos: PartialOrd,
 {
     fn partial_cmp(&self, other: &Span<Pos>) -> Option<Ordering> {
-        self.start
-            .partial_cmp(&other.start)
-            .and_then(|ord| if ord == Ordering::Equal {
+        self.start.partial_cmp(&other.start).and_then(|ord| {
+            if ord == Ordering::Equal {
                 self.end.partial_cmp(&self.end)
             } else {
                 Some(ord)
-            })
+            }
+        })
     }
 }
 
@@ -175,13 +175,14 @@ where
     }
 }
 
-
 impl<Pos: Ord> Span<Pos> {
     pub fn new(start: Pos, end: Pos) -> Span<Pos> {
         Span::with_id(start, end, NO_EXPANSION)
     }
 
     pub fn with_id(start: Pos, end: Pos, no_expansion: ExpansionId) -> Span<Pos> {
+        // FIXME #416
+        // debug_assert!(start <= end, "Invalid span");
         Span {
             start: start,
             end: end,
@@ -213,8 +214,8 @@ impl<Pos: Ord> Span<Pos> {
 
     pub fn merge(self, other: Span<Pos>) -> Option<Span<Pos>> {
         assert!(self.expansion_id == other.expansion_id);
-        if (self.start <= other.start && self.end > other.start) ||
-            (self.start >= other.start && self.start < other.end)
+        if (self.start <= other.start && self.end > other.start)
+            || (self.start >= other.start && self.start < other.end)
         {
             Some(Span {
                 start: cmp::min(self.start, other.start),
@@ -238,7 +239,7 @@ impl<Pos: Ord> Span<Pos> {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Spanned<T, Pos> {
     pub span: Span<Pos>,
     pub value: T,
@@ -253,12 +254,6 @@ impl<T, Pos> Spanned<T, Pos> {
             span: self.span,
             value: f(self.value),
         }
-    }
-}
-
-impl<T: PartialEq, Pos> PartialEq for Spanned<T, Pos> {
-    fn eq(&self, other: &Spanned<T, Pos>) -> bool {
-        self.value == other.value
     }
 }
 

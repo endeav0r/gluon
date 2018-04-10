@@ -1,7 +1,8 @@
 //@NO-IMPLICIT-PRELUDE
 
-let { Bool, Ordering } = import! "std/types.glu"
-let { Semigroup, Monoid, Group, Eq, Ord, Show, id } = import! "std/prelude.glu"
+let { Bool, Ordering } = import! std.types
+let { Semigroup, Monoid, Group, Eq, Ord, Show } = import! std.prelude
+let { id } = import! std.function
 
 /// Boolean 'not'
 let not x : Bool -> Bool = if x then False else True
@@ -16,7 +17,7 @@ let conjunctive =
 
     let monoid : Monoid Bool = {
         semigroup = semigroup,
-        empty = True
+        empty = True,
     }
 
     { semigroup, monoid }
@@ -28,7 +29,7 @@ let disjunctive =
 
     let monoid : Monoid Bool = {
         semigroup = semigroup,
-        empty = False
+        empty = False,
     }
 
     { semigroup, monoid }
@@ -38,12 +39,12 @@ let exclusive =
 
     let monoid : Monoid Bool = {
         semigroup = semigroup,
-        empty = False
+        empty = False,
     }
 
     let group : Group Bool = {
         monoid = monoid,
-        inverse = id
+        inverse = id,
     }
 
     { semigroup, monoid, group }
@@ -69,5 +70,5 @@ let show : Show Bool = {
     exclusive,
     eq,
     ord,
-    show
+    show,
 }

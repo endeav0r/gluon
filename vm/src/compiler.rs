@@ -1,9 +1,9 @@
 use std::ops::{Deref, DerefMut};
 use interner::InternedStr;
-use base::ast::{DisplayEnv, Literal, SpannedExpr, Typed, TypedIdent};
+use base::ast::{self, DisplayEnv, Literal, Typed, TypedIdent};
 use base::resolve;
 use base::kind::{ArcKind, KindEnv};
-use base::types::{self, Alias, ArcType, BuiltinType, RecordSelector, Type, TypeEnv};
+use base::types::{self, Alias, ArcType, BuiltinType, Type, TypeEnv};
 use base::scoped_map::ScopedMap;
 use base::symbol::{Symbol, SymbolModule, SymbolRef};
 use base::pos::{Line, NO_EXPANSION};
@@ -19,9 +19,8 @@ use {Error, Result};
 #[derive(Clone, Debug)]
 pub enum Variable<G> {
     Stack(VmIndex),
-    Global(G),
     Constructor(VmTag, VmIndex),
-    UpVar(VmIndex),
+    UpVar(G),
 }
 
 /// Field accesses on records can either be by name in the case of polymorphic records or by offset
@@ -38,8 +37,7 @@ enum FieldAccess {
 pub struct UpvarInfo {
     pub name: String,
     #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::borrow"))]
-    pub typ:
-        ArcType,
+    pub typ: ArcType,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -49,9 +47,23 @@ pub struct UpvarInfo {
 pub struct DebugInfo {
     /// Maps instruction indexes to the line that spawned them
     pub source_map: SourceMap,
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub local_map: LocalMap,
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub upvars: Vec<UpvarInfo>,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub local_map: LocalMap,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub upvars: Vec<UpvarInfo>,
     pub source_name: String,
+}
+
+#[derive(Debug)]
+#[cfg_attr(feature = "serde_derive_state", derive(SerializeState, DeserializeState))]
+#[cfg_attr(feature = "serde_derive_state", serde(deserialize_state = "::serialization::DeSeed"))]
+#[cfg_attr(feature = "serde_derive_state", serde(serialize_state = "::serialization::SeSeed"))]
+pub struct CompiledModule {
+    /// Storage for globals which are needed by the module which is currently being compiled
+    #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::borrow"))]
+    pub module_globals: Vec<Symbol>,
+    #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::borrow"))]
+    pub function: CompiledFunction,
 }
 
 #[derive(Debug)]
@@ -62,23 +74,34 @@ pub struct CompiledFunction {
     pub args: VmIndex,
     /// The maximum possible number of stack slots needed for this function
     pub max_stack_size: VmIndex,
+
     #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::borrow"))]
-    pub id:
-        Symbol,
+    pub id: Symbol,
+
     #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::borrow"))]
-    pub typ:
-        ArcType,
+    pub typ: ArcType,
     pub instructions: Vec<Instruction>,
+
     #[cfg_attr(feature = "serde_derive_state", serde(state))]
-    pub inner_functions:
-        Vec<CompiledFunction>,
-    #[cfg_attr(feature = "serde_derive_state", serde(state))] pub strings: Vec<InternedStr>,
-    /// Storage for globals which are needed by the module which is currently being compiled
-    #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::borrow"))]
-    pub module_globals: Vec<Symbol>,
+    pub inner_functions: Vec<CompiledFunction>,
+
+    #[cfg_attr(feature = "serde_derive_state", serde(state))]
+    pub strings: Vec<InternedStr>,
+
     #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::borrow"))]
     pub records: Vec<Vec<Symbol>>,
-    #[cfg_attr(feature = "serde_derive_state", serde(state))] pub debug_info: DebugInfo,
+
+    #[cfg_attr(feature = "serde_derive_state", serde(state))]
+    pub debug_info: DebugInfo,
+}
+
+impl From<CompiledFunction> for CompiledModule {
+    fn from(function: CompiledFunction) -> Self {
+        CompiledModule {
+            module_globals: Vec::new(),
+            function,
+        }
+    }
 }
 
 impl CompiledFunction {
@@ -91,7 +114,6 @@ impl CompiledFunction {
             instructions: Vec::new(),
             inner_functions: Vec::new(),
             strings: Vec::new(),
-            module_globals: Vec::new(),
             records: Vec::new(),
             debug_info: DebugInfo {
                 source_map: SourceMap::new(),
@@ -155,21 +177,32 @@ impl FunctionEnvs {
         compiler.stack_types.exit_scope();
         compiler.stack_constructors.exit_scope();
         let instructions = self.function.instructions.len();
+
         if compiler.emit_debug_info {
             self.function
                 .debug_info
                 .source_map
                 .close(instructions, current_line);
-            let function = &mut **self;
-            function.function.debug_info.upvars.extend(
-                function.free_vars.iter().map(|&(ref name, ref typ)| {
-                    UpvarInfo {
-                        name: name.declared_name().to_string(),
-                        typ: typ.clone(),
-                    }
-                }),
-            );
+
+            let upvars_are_globals = self.envs.len() == 1;
+            if !upvars_are_globals {
+                let function = &mut **self;
+                function
+                    .function
+                    .debug_info
+                    .upvars
+                    .extend(
+                        function
+                            .free_vars
+                            .iter()
+                            .map(|&(ref name, ref typ)| UpvarInfo {
+                                name: name.declared_name().to_string(),
+                                typ: typ.clone(),
+                            }),
+                    );
+            }
         }
+
         self.envs.pop().expect("FunctionEnv in scope")
     }
 }
@@ -246,7 +279,6 @@ impl FunctionEnv {
         Ok(())
     }
 
-
     fn add_record_map(&mut self, fields: Vec<Symbol>) -> VmIndex {
         match self.function.records.iter().position(|t| *t == fields) {
             Some(i) => i as VmIndex,
@@ -283,7 +315,7 @@ impl FunctionEnv {
     }
 
     fn stack_size(&mut self) -> VmIndex {
-        (self.stack_size - 1) as VmIndex
+        self.stack_size as VmIndex
     }
 
     fn push_stack_var(&mut self, compiler: &Compiler, s: Symbol, typ: ArcType) {
@@ -309,7 +341,7 @@ impl FunctionEnv {
         let mut count = 0;
         for x in self.stack.exit_scope() {
             count += 1;
-            debug!("Pop var: {:?}", x);
+            debug!("Pop var: ({:?}, {:?})", x.0, (x.1).0);
             if self.emit_debug_info && compiler.empty_symbol != x.0 {
                 self.function
                     .debug_info
@@ -322,11 +354,11 @@ impl FunctionEnv {
 }
 
 pub trait CompilerEnv: TypeEnv {
-    fn find_var(&self, id: &Symbol) -> Option<Variable<Symbol>>;
+    fn find_var(&self, id: &Symbol) -> Option<(Variable<Symbol>, ArcType)>;
 }
 
 impl CompilerEnv for TypeInfos {
-    fn find_var(&self, id: &Symbol) -> Option<Variable<Symbol>> {
+    fn find_var(&self, id: &Symbol) -> Option<(Variable<Symbol>, ArcType)> {
         fn count_function_args(typ: &ArcType) -> VmIndex {
             match typ.as_function() {
                 Some((_, ret)) => 1 + count_function_args(ret),
@@ -344,7 +376,10 @@ impl CompilerEnv for TypeInfos {
             })
             .next()
             .map(|(tag, field)| {
-                Variable::Constructor(tag as VmTag, count_function_args(&field.typ))
+                (
+                    Variable::Constructor(tag as VmTag, count_function_args(&field.typ)),
+                    field.typ.clone(),
+                )
             })
     }
 }
@@ -375,18 +410,10 @@ impl<'a> TypeEnv for Compiler<'a> {
     fn find_type_info(&self, id: &SymbolRef) -> Option<&Alias<Symbol, ArcType>> {
         self.stack_types.get(id)
     }
-
-    fn find_record(
-        &self,
-        _fields: &[Symbol],
-        _selector: RecordSelector,
-    ) -> Option<(ArcType, ArcType)> {
-        None
-    }
 }
 
 impl<'a, T: CompilerEnv> CompilerEnv for &'a T {
-    fn find_var(&self, s: &Symbol) -> Option<Variable<Symbol>> {
+    fn find_var(&self, s: &Symbol) -> Option<(Variable<Symbol>, ArcType)> {
         (**self).find_var(s)
     }
 }
@@ -418,7 +445,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn find(&self, id: &Symbol, current: &mut FunctionEnvs) -> Option<Variable<VmIndex>> {
-        let variable = self.stack_constructors
+        self.stack_constructors
             .iter()
             .filter_map(|(_, typ)| match **typ {
                 Type::Variant(ref row) => row.row_iter()
@@ -451,29 +478,21 @@ impl<'a> Compiler<'a> {
                             .next()
                     })
             })
-            .or_else(|| self.globals.find_var(&id));
-        variable.map(|variable| match variable {
-            Stack(i) => Stack(i),
-            Global(s) => {
-                let existing = current
-                    .function
-                    .module_globals
-                    .iter()
-                    .position(|existing| existing == &s);
-                Global(existing.unwrap_or_else(|| {
-                    current.function.module_globals.push(s);
-                    current.function.module_globals.len() - 1
-                }) as VmIndex)
-            }
-            Constructor(tag, args) => Constructor(tag, args),
-            UpVar(i) => UpVar(i),
-        })
+            .or_else(|| {
+                self.globals
+                    .find_var(&id)
+                    .map(|(variable, typ)| match variable {
+                        Stack(i) => Stack(i),
+                        UpVar(id) => UpVar(current.upvar(&id, &typ)),
+                        Constructor(tag, args) => Constructor(tag, args),
+                    })
+            })
     }
 
     fn find_field(&self, typ: &ArcType, field: &Symbol) -> Option<FieldAccess> {
         // Remove all type aliases to get the actual record type
         let typ = resolve::remove_aliases_cow(self, typ);
-        let mut iter = typ.row_iter();
+        let mut iter = typ.remove_forall().row_iter();
         match iter.by_ref().position(|f| f.name.name_eq(field)) {
             Some(index) => {
                 for _ in iter.by_ref() {}
@@ -489,7 +508,8 @@ impl<'a> Compiler<'a> {
     }
 
     fn find_tag(&self, typ: &ArcType, constructor: &Symbol) -> Option<VmTag> {
-        match **resolve::remove_aliases_cow(self, typ) {
+        let x = resolve::remove_aliases_cow(self, typ);
+        match **x {
             Type::Variant(ref row) => row.row_iter()
                 .enumerate()
                 .find(|&(_, field)| field.name == *constructor)
@@ -500,13 +520,7 @@ impl<'a> Compiler<'a> {
 
     /// Compiles an expression to a zero argument function which can be directly fed to the
     /// interpreter
-    pub fn compile_expr(&mut self, expr: &SpannedExpr<Symbol>) -> Result<CompiledFunction> {
-        let env = self.vm.get_env();
-        let translator = core::Translator::new(&*env);
-        let expr = {
-            let expr = translator.allocator.arena.alloc(translator.translate(expr));
-            core::optimize::optimize(&translator.allocator, expr)
-        };
+    pub fn compile_expr(&mut self, expr: CExpr) -> Result<CompiledModule> {
         let mut env = FunctionEnvs::new();
         let id = self.empty_symbol.clone();
         let typ = expr.env_type_of(&self.globals);
@@ -515,23 +529,34 @@ impl<'a> Compiler<'a> {
         info!("COMPILING: {}", expr);
         self.compile(&expr, &mut env, true)?;
         let current_line = self.source.line_number_at_byte(expr.span().end);
-        let FunctionEnv { function, .. } = env.end_function(self, current_line);
-        Ok(function)
+        let FunctionEnv {
+            function,
+            free_vars,
+            ..
+        } = env.end_function(self, current_line);
+        Ok(CompiledModule {
+            module_globals: free_vars.into_iter().map(|(symbol, _)| symbol).collect(),
+            function,
+        })
     }
 
     fn load_identifier(&self, id: &Symbol, function: &mut FunctionEnvs) -> Result<()> {
-        match self.find(id, function)
-            .unwrap_or_else(|| panic!("Undefined variable {}", self.symbols.string(&id)))
-        {
+        match self.find(id, function).unwrap_or_else(|| {
+            ice!(
+                "Undefined variable `{}` in {}",
+                self.symbols.string(&id),
+                self.source_name,
+            )
+        }) {
             Stack(index) => function.emit(Push(index)),
             UpVar(index) => function.emit(PushUpVar(index)),
-            Global(index) => function.emit(PushGlobal(index)),
             // Zero argument constructors can be compiled as integers
             Constructor(tag, 0) => function.emit(Construct { tag: tag, args: 0 }),
             Constructor(..) => {
-                return Err(Error::Message(
-                    format!("Constructor `{}` is not fully applied", id),
-                ))
+                return Err(Error::Message(format!(
+                    "Constructor `{}` is not fully applied",
+                    id
+                )))
             }
         }
         Ok(())
@@ -578,7 +603,7 @@ impl<'a> Compiler<'a> {
             Expr::Const(ref lit, _) => match *lit {
                 Literal::Int(i) => function.emit(PushInt(i as isize)),
                 Literal::Byte(b) => function.emit(PushByte(b)),
-                Literal::Float(f) => function.emit(PushFloat(f)),
+                Literal::Float(f) => function.emit(PushFloat(f.into_inner())),
                 Literal::String(ref s) => function.emit_string(self.intern(&s)?),
                 Literal::Char(c) => function.emit(PushInt(c as isize)),
             },
@@ -639,8 +664,9 @@ impl<'a> Compiler<'a> {
             }
             Expr::Call(func, args) => {
                 if let Expr::Ident(ref id, _) = *func {
-                    if id.name.as_ref() == "&&" || id.name.as_ref() == "||" ||
-                        id.name.as_ref().starts_with('#')
+                    if id.name.as_ref() == "&&" || id.name.as_ref() == "||"
+                        || (id.name.as_ref().starts_with('#')
+                            && id.name.declared_name() != "#error")
                     {
                         self.compile_primitive(&id.name, args, function, tail_position)?;
                         return Ok(None);
@@ -668,49 +694,68 @@ impl<'a> Compiler<'a> {
                 // Indexes for each alternative for a successful match to the alternatives code
                 let mut start_jumps = Vec::new();
                 let typ = expr.env_type_of(self);
-                let mut catch_all = false;
                 // Emit a TestTag + Jump instuction for each alternative which jumps to the
                 // alternatives code if TestTag is sucessesful
                 for alt in alts.iter() {
                     match alt.pattern {
                         Pattern::Constructor(ref id, _) => {
-                            let tag = self.find_tag(&typ, &id.name).unwrap_or_else(|| {
-                                panic!(
-                                    "ICE: Could not find tag for {}::{} when matching on \
-                                     expression `{}`",
-                                    typ,
-                                    self.symbols.string(&id.name),
-                                    expr
-                                )
-                            });
+                            let tag = self.find_tag(typ.remove_forall(), &id.name).unwrap_or_else(
+                                || {
+                                    ice!(
+                                        "ICE: Could not find tag for {}::{} when matching on \
+                                         expression `{}`",
+                                        typ,
+                                        self.symbols.string(&id.name),
+                                        expr
+                                    )
+                                },
+                            );
                             function.emit(TestTag(tag));
                             start_jumps.push(function.function.instructions.len());
                             function.emit(CJump(0));
                         }
                         Pattern::Record { .. } => {
-                            catch_all = true;
                             start_jumps.push(function.function.instructions.len());
                         }
-                        _ => {
-                            catch_all = true;
+                        Pattern::Ident(_) => {
                             start_jumps.push(function.function.instructions.len());
                             function.emit(Jump(0));
                         }
+                        Pattern::Literal(ref l) => {
+                            let lhs_i = function.stack_size() - 1;
+                            match *l {
+                                ast::Literal::Byte(b) => {
+                                    function.emit(Push(lhs_i));
+                                    function.emit(PushByte(b));
+                                    function.emit(ByteEQ);
+                                }
+                                ast::Literal::Int(i) => {
+                                    function.emit(Push(lhs_i));
+                                    function.emit(PushInt(i as isize));
+                                    function.emit(IntEQ);
+                                }
+                                ast::Literal::Char(ch) => {
+                                    function.emit(Push(lhs_i));
+                                    function.emit(PushInt(ch as isize));
+                                    function.emit(IntEQ);
+                                }
+                                ast::Literal::Float(f) => {
+                                    function.emit(Push(lhs_i));
+                                    function.emit(PushFloat(f.into_inner()));
+                                    function.emit(FloatEQ);
+                                }
+                                ast::Literal::String(ref s) => {
+                                    self.load_identifier(&Symbol::from("@string_eq"), function)?;
+                                    let lhs_i = function.stack_size() - 2;
+                                    function.emit(Push(lhs_i));
+                                    function.emit_string(self.intern(&s)?);
+                                    function.emit(Call(2));
+                                }
+                            };
+                            start_jumps.push(function.function.instructions.len());
+                            function.emit(CJump(0));
+                        }
                     }
-                }
-                let constructors_in_type =
-                    resolve::remove_aliases_cow(self, &typ).row_iter().count();
-                // Create a catch all to prevent us from running into undefined behaviour
-                // If a catch all already exists or all constructors have been matched then we can
-                // skip it
-                if !catch_all && alts.len() != constructors_in_type {
-                    let error_fn = self.symbols.symbol("#error");
-                    self.load_identifier(&error_fn, function)?;
-                    function.emit_string(self.intern("Non-exhaustive pattern")?);
-                    function.emit(Call(1));
-                    // The stack has been increased by 1 here but it should not affect compiling the
-                    // alternatives
-                    function.stack_size -= 1;
                 }
                 // Indexes for each alternative from the end of the alternatives code to code
                 // after the alternative
@@ -736,6 +781,12 @@ impl<'a> Compiler<'a> {
                                 Jump(function.function.instructions.len() as VmIndex);
                             function.new_stack_var(self, id.name.clone(), id.typ.clone());
                         }
+                        Pattern::Literal(_) => {
+                            function.function.instructions[start_index] =
+                                CJump(function.function.instructions.len() as VmIndex);
+                            // Add a dummy variable to mark where the literal itself is stored
+                            function.new_stack_var(self, self.empty_symbol.clone(), Type::hole());
+                        }
                     }
                     self.compile(&alt.expr, function, tail_position)?;
                     let count = function.exit_scope(self);
@@ -753,8 +804,8 @@ impl<'a> Compiler<'a> {
                 for expr in exprs {
                     self.compile(expr, function, false)?;
                 }
-                let typ = resolve::remove_aliases_cow(self, &id.typ);
-                match **typ {
+                let typ = resolve::remove_aliases_cow(self, &id.typ.remove_forall());
+                match **typ.remove_forall() {
                     Type::Record(_) => {
                         let index = function.add_record_map(
                             typ.row_iter().map(|field| field.name.clone()).collect(),
@@ -776,7 +827,7 @@ impl<'a> Compiler<'a> {
                             args: exprs.len() as u32,
                         });
                     }
-                    _ => panic!("ICE: Unexpected data type: {}", typ),
+                    _ => ice!("ICE: Unexpected data type: {}", typ),
                 }
             }
         }
@@ -799,8 +850,8 @@ impl<'a> Compiler<'a> {
             function.emit(CJump(lhs_end as VmIndex + 3)); //Jump to rhs evaluation
             function.emit(Construct { tag: 0, args: 0 });
             function.emit(Jump(0)); //lhs false, jump to after rhs
-            // Dont count the integer added added above as the next part of the code never
-            // pushed it
+                                    // Dont count the integer added added above as the next part of the code never
+                                    // pushed it
             function.stack_size -= 1;
             self.compile(rhs, function, tail_position)?;
             // replace jump instruction
@@ -862,15 +913,16 @@ impl<'a> Compiler<'a> {
                 function.new_stack_var(self, name.name.clone(), pattern_type.clone());
             }
             Pattern::Record(ref fields) => {
-                let typ = resolve::remove_aliases(self, pattern_type.clone());
-                match *typ {
+                let typ = resolve::remove_aliases(self, pattern_type.remove_forall().clone());
+                let typ = typ.remove_forall();
+                match **typ {
                     Type::Record(_) => {
                         let mut field_iter = typ.row_iter();
                         let number_of_fields = field_iter.by_ref().count();
                         let is_polymorphic = **field_iter.current_type() != Type::EmptyRow;
-                        if fields.len() == 0 ||
-                            (number_of_fields > 4 && number_of_fields / fields.len() >= 4) ||
-                            is_polymorphic
+                        if fields.len() == 0
+                            || (number_of_fields > 4 && number_of_fields / fields.len() >= 4)
+                            || is_polymorphic
                         {
                             // For pattern matches on large records where only a few of the fields
                             // are used we instead emit a series of GetOffset instructions to avoid
@@ -882,7 +934,7 @@ impl<'a> Compiler<'a> {
                             // of slots are removed when exiting
                             function.new_stack_var(self, self.empty_symbol.clone(), Type::hole());
 
-                            let record_index = function.stack_size();
+                            let record_index = function.stack_size() - 1;
                             for pattern_field in fields {
                                 function.emit(Push(record_index));
                                 function.emit_field(self, &typ, &pattern_field.0.name)?;
@@ -913,10 +965,11 @@ impl<'a> Compiler<'a> {
                             }
                         }
                     }
-                    _ => panic!("Expected record, got {} at {:?}", typ, pattern),
+                    _ => ice!("Expected record, got {} at {:?}", typ, pattern),
                 }
             }
-            Pattern::Constructor(..) => panic!("constructor pattern in let"),
+            Pattern::Constructor(..) => ice!("constructor pattern in let"),
+            Pattern::Literal(_) => ice!("literal pattern in let"),
         }
         Ok(())
     }
@@ -946,7 +999,7 @@ impl<'a> Compiler<'a> {
             match self.find(var, function).expect("free_vars: find") {
                 Stack(index) => function.emit(Push(index)),
                 UpVar(index) => function.emit(PushUpVar(index)),
-                _ => panic!("Free variables can only be on the stack or another upvar"),
+                _ => ice!("Free variables can only be on the stack or another upvar"),
             }
         }
         let function_index = function.function.inner_functions.len() as VmIndex;

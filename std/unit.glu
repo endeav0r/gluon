@@ -1,5 +1,6 @@
-let { Eq, Ord, Ordering, Show, const } = import! "std/prelude.glu"
-let { Bool } = import! "std/bool.glu"
+let { Eq, Ord, Ordering, Show } = import! std.prelude
+let { const } = import! std.function
+let { Bool } = import! std.bool
 
 let eq : Eq () = { (==) = const (const True) }
 
@@ -10,5 +11,5 @@ let show : Show () = { show = const "()" }
 {
     eq,
     ord,
-    show
+    show,
 }

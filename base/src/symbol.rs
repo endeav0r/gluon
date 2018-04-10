@@ -92,7 +92,6 @@ impl AsRef<str> for Symbol {
     }
 }
 
-
 impl fmt::Debug for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", &**self)
@@ -138,7 +137,6 @@ where
     }
 }
 
-
 #[derive(Eq)]
 #[cfg_attr(feature = "serde_derive", derive(SerializeState))]
 #[cfg_attr(feature = "serde_derive", serde(serialize_state = "::serialization::SeSeed"))]
@@ -180,12 +178,6 @@ impl Hash for SymbolRef {
     }
 }
 
-impl AsRef<str> for SymbolRef {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
 impl Symbol {
     pub fn strong_count(sym: &Symbol) -> usize {
         Arc::strong_count(&sym.0)
@@ -193,19 +185,32 @@ impl Symbol {
 }
 
 impl SymbolRef {
+    #[inline]
+    pub fn new<N: ?Sized + AsRef<str>>(n: &N) -> &SymbolRef {
+        unsafe { ::std::mem::transmute::<&Name, &SymbolRef>(Name::new(n)) }
+    }
+
     /// Checks whether the names of two symbols are equal
     pub fn name_eq(&self, other: &SymbolRef) -> bool {
         self.name() == other.name()
     }
 
     pub fn name(&self) -> &Name {
-        Name::new(self)
+        Name::new(&self.0)
     }
 
-    /// Returns the name of this symbol as it was originally declared (strips location information)
+    /// Returns the name of this symbol as it was originally declared (strips location information
+    /// and module information)
     pub fn declared_name(&self) -> &str {
-        let name = self.as_ref();
-        name.split(':').next().unwrap_or(name)
+        self.name().declared_name()
+    }
+
+    pub fn definition_name(&self) -> &str {
+        self.name().definition_name()
+    }
+
+    pub fn is_global(&self) -> bool {
+        self.0.chars().next() == Some('@')
     }
 
     fn ptr(&self) -> *const () {
@@ -228,13 +233,28 @@ impl PartialEq for Name {
     }
 }
 
-pub struct Components<'a>(::std::str::Split<'a, char>);
+pub struct Components<'a>(&'a str);
 
 impl<'a> Iterator for Components<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<&'a str> {
-        self.0.next()
+        if self.0.is_empty() {
+            None
+        } else {
+            Some(match self.0.find('.') {
+                Some(i) => {
+                    let (before, after) = self.0.split_at(i);
+                    self.0 = &after[1..];
+                    before
+                }
+                None => {
+                    let s = self.0;
+                    self.0 = "";
+                    s
+                }
+            })
+        }
     }
 }
 
@@ -245,11 +265,12 @@ impl Name {
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        let name = &self.0;
+        name.split(':').next().unwrap_or(name)
     }
 
     pub fn components(&self) -> Components {
-        Components(self.0.split('.'))
+        Components(&self.0)
     }
 
     pub fn module(&self) -> &Name {
@@ -261,6 +282,16 @@ impl Name {
         self.0
             .rfind('.')
             .map_or(self, |i| Name::new(&self.0[i + 1..]))
+    }
+
+    pub fn declared_name(&self) -> &str {
+        let name = self.definition_name();
+        name.rsplit('.').next().unwrap_or(name)
+    }
+
+    pub fn definition_name(&self) -> &str {
+        let name = self.as_str().trim_left_matches('@');
+        name.split(':').next().unwrap_or(name)
     }
 }
 
@@ -380,6 +411,13 @@ impl Symbols {
         self.make_symbol(name.into())
     }
 
+    pub fn contains_name<N>(&mut self, name: N) -> bool
+    where
+        N: AsRef<Name>,
+    {
+        self.indexes.contains_key(name.as_ref())
+    }
+
     pub fn len(&self) -> usize {
         self.strings.len()
     }
@@ -411,6 +449,13 @@ impl<'a> SymbolModule<'a> {
         self.symbols.symbol(name)
     }
 
+    pub fn contains_name<N>(&mut self, name: N) -> bool
+    where
+        N: AsRef<Name>,
+    {
+        self.symbols.contains_name(name.as_ref())
+    }
+
     /// Creates a symbol which is prefixed by the `module` argument passed in `new`
     ///
     /// ```
@@ -427,6 +472,10 @@ impl<'a> SymbolModule<'a> {
         let symbol = self.symbols.symbol(&*self.module);
         self.module.0.truncate(len);
         symbol
+    }
+
+    pub fn module(&self) -> &Name {
+        &self.module
     }
 
     pub fn len(&self) -> usize {

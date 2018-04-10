@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::fmt;
+use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::marker::PhantomData;
@@ -8,7 +9,8 @@ use pretty::{Arena, DocAllocator, DocBuilder};
 
 use smallvec::{SmallVec, VecLike};
 
-use ast::{Comment, Commented, IdentEnv};
+use ast::{Comment, Commented, EmptyEnv, IdentEnv};
+use fnv::FnvMap;
 use kind::{ArcKind, Kind, KindEnv};
 use merge::merge;
 use pos::{BytePos, HasSpan, Span};
@@ -23,6 +25,7 @@ use serde::de::DeserializeState;
 use serde::ser::SerializeState;
 
 use self::pretty_print::Printer;
+pub use self::pretty_print::{Filter, TypeFormatter};
 
 pub mod pretty_print;
 
@@ -33,39 +36,6 @@ pub trait TypeEnv: KindEnv {
 
     /// Returns information about the type `id`
     fn find_type_info(&self, id: &SymbolRef) -> Option<&Alias<Symbol, ArcType>>;
-
-    /// Returns a record which contains all `fields`. The first element is the record type and the
-    /// second is the alias type.
-    fn find_record(
-        &self,
-        fields: &[Symbol],
-        selector: RecordSelector,
-    ) -> Option<(ArcType, ArcType)>;
-}
-
-pub enum RecordSelector {
-    // Selects a record which exactly has the fields
-    Exact,
-    // Selects a record which has all the passed fields (in any order)
-    Subset,
-}
-
-impl RecordSelector {
-    /// Returns `true` if the iterators matches according to the selector
-    pub fn matches<F, I, J>(&self, mut record: F, needle: J) -> bool
-    where
-        F: FnMut() -> I,
-        I: IntoIterator,
-        J: IntoIterator<Item = I::Item>,
-        I::Item: PartialEq,
-    {
-        match *self {
-            RecordSelector::Exact => record().into_iter().eq(needle),
-            RecordSelector::Subset => needle
-                .into_iter()
-                .all(|name| record().into_iter().any(|other| other == name)),
-        }
-    }
 }
 
 impl<'a, T: ?Sized + TypeEnv> TypeEnv for &'a T {
@@ -76,15 +46,18 @@ impl<'a, T: ?Sized + TypeEnv> TypeEnv for &'a T {
     fn find_type_info(&self, id: &SymbolRef) -> Option<&Alias<Symbol, ArcType>> {
         (**self).find_type_info(id)
     }
+}
 
-    fn find_record(
-        &self,
-        fields: &[Symbol],
-        selector: RecordSelector,
-    ) -> Option<(ArcType, ArcType)> {
-        (**self).find_record(fields, selector)
+impl TypeEnv for EmptyEnv<Symbol> {
+    fn find_type(&self, _id: &SymbolRef) -> Option<&ArcType> {
+        None
+    }
+
+    fn find_type_info(&self, _id: &SymbolRef) -> Option<&Alias<Symbol, ArcType>> {
+        None
     }
 }
+
 
 /// Trait which is a `TypeEnv` which also provides access to the type representation of some
 /// primitive types
@@ -113,7 +86,17 @@ where
         I::IntoIter: DoubleEndedIterator<Item = T>,
     {
         args.into_iter().rev().fold(ret, |body, arg| {
-            Type::app(self.function_builtin(), collect![arg, body])
+            T::from(Type::Function(ArgType::Explicit, arg, body))
+        })
+    }
+
+    pub fn function_implicit<I>(&self, args: I, ret: T) -> T
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: DoubleEndedIterator<Item = T>,
+    {
+        args.into_iter().rev().fold(ret, |body, arg| {
+            T::from(Type::Function(ArgType::Implicit, arg, body))
         })
     }
 
@@ -125,11 +108,9 @@ where
         let fields: Vec<_> = elems
             .into_iter()
             .enumerate()
-            .map(|(i, typ)| {
-                Field {
-                    name: symbols.from_str(&format!("_{}", i)),
-                    typ: typ,
-                }
+            .map(|(i, typ)| Field {
+                name: symbols.from_str(&format!("_{}", i)),
+                typ: typ,
             })
             .collect();
         if fields.is_empty() {
@@ -227,7 +208,8 @@ impl BuiltinType {
 #[cfg_attr(feature = "serde_derive", serde(deserialize_state = "Seed<Id, T>"))]
 #[cfg_attr(feature = "serde_derive", serde(de_parameters = "Id, T"))]
 pub struct TypeVariable {
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub kind: ArcKind,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub kind: ArcKind,
     pub id: u32,
 }
 
@@ -240,9 +222,28 @@ pub struct TypeVariable {
 #[cfg_attr(feature = "serde_derive", serde(de_parameters = "T"))]
 #[cfg_attr(feature = "serde_derive", serde(serialize_state = "SeSeed"))]
 #[cfg_attr(feature = "serde_derive", serde(bound(serialize = "Id: SerializeState<SeSeed>")))]
+pub struct Skolem<Id> {
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub name: Id,
+    pub id: u32,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub kind: ArcKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde_derive", derive(DeserializeState, SerializeState))]
+#[cfg_attr(feature = "serde_derive", serde(deserialize_state = "Seed<Id, T>"))]
+#[cfg_attr(feature = "serde_derive",
+           serde(bound(deserialize = "
+           Id: DeserializeState<'de, Seed<Id, T>> + Clone + ::std::any::Any")))]
+#[cfg_attr(feature = "serde_derive", serde(de_parameters = "T"))]
+#[cfg_attr(feature = "serde_derive", serde(serialize_state = "SeSeed"))]
+#[cfg_attr(feature = "serde_derive", serde(bound(serialize = "Id: SerializeState<SeSeed>")))]
 pub struct Generic<Id> {
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub id: Id,
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub kind: ArcKind,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub id: Id,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub kind: ArcKind,
 }
 
 impl<Id> Generic<Id> {
@@ -263,7 +264,9 @@ impl<Id> Generic<Id> {
 #[cfg_attr(feature = "serde_derive", serde(serialize_state = "SeSeed"))]
 #[cfg_attr(feature = "serde_derive", serde(bound(serialize = "T: SerializeState<SeSeed>")))]
 pub struct Alias<Id, T> {
-    #[cfg_attr(feature = "serde_derive", serde(state))] _typ: T,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    _typ: T,
+    #[cfg_attr(feature = "serde_derive", serde(skip))]
     _marker: PhantomData<Id>,
 }
 
@@ -271,11 +274,11 @@ impl<Id, T> Deref for Alias<Id, T>
 where
     T: Deref<Target = Type<Id, T>>,
 {
-    type Target = AliasData<Id, T>;
+    type Target = AliasRef<Id, T>;
 
     fn deref(&self) -> &Self::Target {
         match *self._typ {
-            Type::Alias(ref alias) => &alias.group[alias.index],
+            Type::Alias(ref alias) => alias,
             _ => unreachable!(),
         }
     }
@@ -287,7 +290,7 @@ where
 {
     fn from(data: AliasData<Id, T>) -> Alias<Id, T> {
         Alias {
-            _typ: Type::alias(data.name, data.args, data.typ),
+            _typ: Type::alias(data.name, data.typ),
             _marker: PhantomData,
         }
     }
@@ -303,9 +306,9 @@ impl<Id, T> Alias<Id, T>
 where
     T: From<Type<Id, T>>,
 {
-    pub fn new(name: Id, args: Vec<Generic<Id>>, typ: T) -> Alias<Id, T> {
+    pub fn new(name: Id, typ: T) -> Alias<Id, T> {
         Alias {
-            _typ: Type::alias(name, args, typ),
+            _typ: Type::alias(name, typ),
             _marker: PhantomData,
         }
     }
@@ -313,14 +316,12 @@ where
     pub fn group(group: Vec<AliasData<Id, T>>) -> Vec<Alias<Id, T>> {
         let group = Arc::new(group);
         (0..group.len())
-            .map(|index| {
-                Alias {
-                    _typ: T::from(Type::Alias(AliasRef {
-                        index: index,
-                        group: group.clone(),
-                    })),
-                    _marker: PhantomData,
-                }
+            .map(|index| Alias {
+                _typ: T::from(Type::Alias(AliasRef {
+                    index: index,
+                    group: group.clone(),
+                })),
+                _marker: PhantomData,
             })
             .collect()
     }
@@ -394,14 +395,18 @@ where
                 Type::Ident(ref id) => {
                     // Replace `Ident` with the alias it resolves to so that a `TypeEnv` is not
                     // needed to resolve the type later on
-                    let index = self.group
-                        .iter()
-                        .position(|alias| alias.name == *id)
-                        .expect("ICE: Alias group were not able to resolve an identifier");
-                    Some(T::from(Type::Alias(AliasRef {
-                        index: index,
-                        group: self.group.clone(),
-                    })))
+                    let replacement = self.group.iter().position(|alias| alias.name == *id).map(
+                        |index| {
+                            T::from(Type::Alias(AliasRef {
+                                index: index,
+                                group: self.group.clone(),
+                            }))
+                        },
+                    );
+                    if replacement.is_none() {
+                        info!("Alias group were not able to resolve an identifier");
+                    }
+                    replacement
                 }
                 _ => None,
             }
@@ -424,21 +429,21 @@ where
 #[cfg_attr(feature = "serde_derive",
            serde(bound(serialize = "T: SerializeState<SeSeed>, Id: SerializeState<SeSeed>")))]
 pub struct AliasData<Id, T> {
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub name: Id,
-    /// Arguments to the alias
     #[cfg_attr(feature = "serde_derive", serde(state))]
-    pub args: Vec<Generic<Id>>,
+    pub name: Id,
     /// The type that is being aliased
     #[cfg_attr(feature = "serde_derive", serde(state))]
     typ: T,
 }
 
-impl<Id, T> AliasData<Id, T> {
+impl<Id, T> AliasData<Id, T>
+where
+    T: From<Type<Id, T>>,
+{
     pub fn new(name: Id, args: Vec<Generic<Id>>, typ: T) -> AliasData<Id, T> {
         AliasData {
             name: name,
-            args: args,
-            typ: typ,
+            typ: Type::forall(args, typ),
         }
     }
 
@@ -450,6 +455,22 @@ impl<Id, T> AliasData<Id, T> {
 
     pub fn unresolved_type_mut(&mut self) -> &mut T {
         &mut self.typ
+    }
+}
+
+impl<Id, T> AliasData<Id, T>
+where
+    T: Deref<Target = Type<Id, T>>,
+{
+    pub fn params(&self) -> &[Generic<Id>] {
+        self.typ.params()
+    }
+
+    pub fn aliased_type(&self) -> &T {
+        match *self.typ {
+            Type::Forall(_, ref typ, _) => typ,
+            _ => &self.typ,
+        }
     }
 }
 
@@ -474,11 +495,13 @@ impl<Id, T> Deref for AliasRef<Id, T> {
 #[cfg_attr(feature = "serde_derive",
            serde(bound(serialize = "T: SerializeState<SeSeed>, Id: SerializeState<SeSeed>")))]
 pub struct Field<Id, T = ArcType<Id>> {
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub name: Id,
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub typ: T,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub name: Id,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub typ: T,
 }
 
-/// `SmallVec` used in the `Type::App` constructor to avoid alloacting a `Vec` for every applied
+/// `SmallVec` used in the `Type::App` constructor to avoid allocating a `Vec` for every applied
 /// type. If `Type` is changed in a way that changes its size it is likely a good idea to change
 /// the number of elements in the `SmallVec` so that it fills out the entire `Type` enum while not
 /// increasing the size of `Type`.
@@ -493,9 +516,16 @@ impl<Id, T> Field<Id, T> {
     }
 }
 
+#[cfg_attr(feature = "serde_derive", derive(Deserialize, Serialize))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ArgType {
+    Explicit,
+    Implicit,
+}
+
 /// The representation of gluon's types.
 ///
-/// For efficency this enum is not stored directly but instead a pointer wrapper which derefs to
+/// For efficiency this enum is not stored directly but instead a pointer wrapper which derefs to
 /// `Type` is used to enable types to be shared. It is recommended to use the static functions on
 /// `Type` such as `Type::app` and `Type::record` when constructing types as those will construct
 /// the pointer wrapper directly.
@@ -520,17 +550,23 @@ pub enum Type<Id, T = ArcType<Id>> {
     Opaque,
     /// A builtin type
     Builtin(BuiltinType),
+    /// Universally quantified types
+    Forall(
+        #[cfg_attr(feature = "serde_derive", serde(state))] Vec<Generic<Id>>,
+        #[cfg_attr(feature = "serde_derive", serde(state))] T,
+        #[cfg_attr(feature = "serde_derive", serde(state))] Option<Vec<T>>,
+    ),
     /// A type application with multiple arguments. For example,
     /// `Map String Int` would be represented as `App(Map, [String, Int])`.
     App(
-        #[cfg_attr(feature = "serde_derive", serde(deserialize_state))]
-        #[cfg_attr(feature = "serde_derive", serde(serialize_state))]
-        T,
-        #[cfg_attr(feature = "serde_derive",
-                   serde(deserialize_state_with = "::serialization::deserialize_type_vec"))]
-        #[cfg_attr(feature = "serde_derive",
-                   serde(serialize_state_with = "::serialization::serialize_seq"))]
-        AppVec<T>,
+        #[cfg_attr(feature = "serde_derive", serde(state))] T,
+        #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::seq"))] AppVec<T>,
+    ),
+    /// Function type which can have a explicit or implicit argument
+    Function(
+        ArgType,
+        #[cfg_attr(feature = "serde_derive", serde(state))] T,
+        #[cfg_attr(feature = "serde_derive", serde(state))] T,
     ),
     /// Record constructor, of kind `Row -> Type`
     Record(#[cfg_attr(feature = "serde_derive", serde(state))] T),
@@ -559,17 +595,21 @@ pub enum Type<Id, T = ArcType<Id>> {
     Ident(#[cfg_attr(feature = "serde_derive", serde(state))] Id),
     /// An unbound type variable that may be unified with other types. These
     /// will eventually be converted into `Type::Generic`s during generalization.
-    Variable(
-        #[cfg_attr(feature = "serde_derive", serde(state))] TypeVariable,
-    ),
+    Variable(#[cfg_attr(feature = "serde_derive", serde(state))] TypeVariable),
     /// A variable that needs to be instantiated with a fresh type variable
-    /// when the binding is refered to.
-    Generic(
-        #[cfg_attr(feature = "serde_derive", serde(state))] Generic<Id>,
-    ),
-    Alias(
-        #[cfg_attr(feature = "serde_derive", serde(state))] AliasRef<Id, T>,
-    ),
+    /// when the binding is referred to.
+    Generic(#[cfg_attr(feature = "serde_derive", serde(state))] Generic<Id>),
+    Alias(#[cfg_attr(feature = "serde_derive", serde(state))] AliasRef<Id, T>),
+    Skolem(#[cfg_attr(feature = "serde_derive", serde(state))] Skolem<Id>),
+}
+
+impl<Id, T> Type<Id, T> {
+    pub fn as_variable(&self) -> Option<&TypeVariable> {
+        match *self {
+            Type::Variable(ref var) => Some(var),
+            _ => None,
+        }
+    }
 }
 
 impl<Id, T> Type<Id, T>
@@ -582,6 +622,25 @@ where
 
     pub fn opaque() -> T {
         T::from(Type::Opaque)
+    }
+
+    pub fn builtin(typ: BuiltinType) -> T {
+        T::from(Type::Builtin(typ))
+    }
+
+    pub fn forall(params: Vec<Generic<Id>>, typ: T) -> T {
+        Type::forall_with_vars(params, typ, None)
+    }
+
+    pub fn forall_with_vars(params: Vec<Generic<Id>>, typ: T, vars: Option<Vec<T>>) -> T {
+        if let Some(ref vars) = vars {
+            debug_assert!(vars.len() == params.len());
+        }
+        if params.is_empty() {
+            typ
+        } else {
+            T::from(Type::Forall(params, typ, vars))
+        }
     }
 
     pub fn array(typ: T) -> T {
@@ -626,11 +685,9 @@ where
             elems
                 .into_iter()
                 .enumerate()
-                .map(|(i, typ)| {
-                    Field {
-                        name: symbols.from_str(&format!("_{}", i)),
-                        typ: typ,
-                    }
+                .map(|(i, typ)| Field {
+                    name: symbols.from_str(&format!("_{}", i)),
+                    typ: typ,
                 })
                 .collect(),
             Type::empty_row(),
@@ -673,9 +730,18 @@ where
     where
         T: Clone,
     {
-        let function: T = Type::builtin(BuiltinType::Function);
         args.into_iter().rev().fold(ret, |body, arg| {
-            Type::app(function.clone(), collect![arg, body])
+            T::from(Type::Function(ArgType::Explicit, arg, body))
+        })
+    }
+
+    pub fn function_implicit<I>(args: I, ret: T) -> T
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: DoubleEndedIterator<Item = T>,
+    {
+        args.into_iter().rev().fold(ret, |body, arg| {
+            T::from(Type::Function(ArgType::Implicit, arg, body))
         })
     }
 
@@ -683,21 +749,20 @@ where
         T::from(Type::Generic(typ))
     }
 
-    pub fn builtin(typ: BuiltinType) -> T {
-        T::from(Type::Builtin(typ))
+    pub fn skolem(typ: Skolem<Id>) -> T {
+        T::from(Type::Skolem(typ))
     }
 
     pub fn variable(typ: TypeVariable) -> T {
         T::from(Type::Variable(typ))
     }
 
-    pub fn alias(name: Id, args: Vec<Generic<Id>>, typ: T) -> T {
+    pub fn alias(name: Id, typ: T) -> T {
         T::from(Type::Alias(AliasRef {
             index: 0,
             group: Arc::new(vec![
                 AliasData {
                     name: name,
-                    args: args,
                     typ: typ,
                 },
             ]),
@@ -742,20 +807,49 @@ where
     T: Deref<Target = Type<Id, T>>,
 {
     pub fn as_function(&self) -> Option<(&T, &T)> {
-        if let Type::App(ref app, ref args) = *self {
-            if args.len() == 2 {
+        self.as_function_with_type().map(|t| (t.1, t.2))
+    }
+
+    pub fn as_function_with_type(&self) -> Option<(ArgType, &T, &T)> {
+        match *self {
+            Type::Function(arg_type, ref arg, ref ret) => return Some((arg_type, arg, ret)),
+            Type::App(ref app, ref args) => if args.len() == 2 {
                 if let Type::Builtin(BuiltinType::Function) = **app {
-                    return Some((&args[0], &args[1]));
+                    return Some((ArgType::Explicit, &args[0], &args[1]));
                 }
-            }
+            } else if args.len() == 1 {
+                if let Type::App(ref app, ref args2) = **app {
+                    if let Type::Builtin(BuiltinType::Function) = **app {
+                        return Some((ArgType::Explicit, &args2[0], &args[0]));
+                    }
+                }
+            },
+            _ => (),
         }
         None
     }
 
-    pub fn unapplied_args(&self) -> &[T] {
+    pub fn unapplied_args(&self) -> Cow<[T]>
+    where
+        T: Clone,
+    {
         match *self {
-            Type::App(_, ref args) => args,
-            _ => &[],
+            Type::App(ref f, ref args) => {
+                let mut f = f;
+                let mut extra_args = Vec::new();
+                while let Type::App(ref f2, ref args2) = **f {
+                    f = f2;
+                    extra_args.extend(args2.iter().rev().cloned());
+                }
+                if extra_args.is_empty() {
+                    Cow::Borrowed(args)
+                } else {
+                    extra_args.reverse();
+                    extra_args.extend(args.iter().cloned());
+                    Cow::Owned(extra_args)
+                }
+            }
+            _ => Cow::Borrowed(&[]),
         }
     }
 
@@ -777,28 +871,12 @@ where
             _ => false,
         }
     }
-}
 
-impl<T> Type<Symbol, T>
-where
-    T: Deref<Target = Type<Symbol, T>>,
-{
-    /// Returns the name of `self`
-    /// Example:
-    /// Option a => Option
-    /// Int => Int
-    pub fn name(&self) -> Option<&SymbolRef> {
-        if let Some(id) = self.alias_ident() {
-            return Some(&**id);
-        }
-
+    pub fn params(&self) -> &[Generic<Id>] {
         match *self {
-            Type::App(ref id, _) => match **id {
-                Type::Builtin(b) => Some(b.symbol()),
-                _ => None,
-            },
-            Type::Builtin(b) => Some(b.symbol()),
-            _ => None,
+            Type::Alias(ref alias) => alias.typ.params(),
+            Type::Forall(ref params, _, _) => params,
+            _ => &[],
         }
     }
 
@@ -808,21 +886,24 @@ where
 
     fn kind_(&self, applied_args: usize) -> Cow<ArcKind> {
         let mut immediate_kind = match *self {
+            Type::Function(_, _, _) => Cow::Owned(Kind::typ()),
             Type::App(ref t, ref args) => t.kind_(args.len()),
             Type::Hole | Type::Opaque | Type::Builtin(_) | Type::Record(_) | Type::Variant(_) => {
                 Cow::Owned(Kind::typ())
             }
             Type::EmptyRow | Type::ExtendRow { .. } => Cow::Owned(Kind::row().into()),
+            Type::Forall(_, ref typ, _) => typ.kind_(applied_args),
             Type::Variable(ref var) => Cow::Borrowed(&var.kind),
+            Type::Skolem(ref skolem) => Cow::Borrowed(&skolem.kind),
             Type::Generic(ref gen) => Cow::Borrowed(&gen.kind),
             // FIXME can be another kind
             Type::Ident(_) => Cow::Owned(Kind::typ()),
             Type::Alias(ref alias) => {
-                return if alias.args.len() < applied_args {
-                    alias.typ.kind_(applied_args - alias.args.len())
+                return if alias.params().len() < applied_args {
+                    alias.typ.kind_(applied_args - alias.params().len())
                 } else {
                     let mut kind = alias.typ.kind_(0).into_owned();
-                    for arg in &alias.args[applied_args..] {
+                    for arg in &alias.params()[applied_args..] {
                         kind = Kind::function(arg.kind.clone(), kind)
                     }
                     Cow::Owned(kind)
@@ -842,6 +923,31 @@ where
             };
         }
         immediate_kind
+    }
+}
+
+impl<T> Type<Symbol, T>
+where
+    T: Deref<Target = Type<Symbol, T>>,
+{
+    /// Returns the name of `self`
+    /// Example:
+    /// Option a => Option
+    /// Int => Int
+    pub fn name(&self) -> Option<&SymbolRef> {
+        if let Some(id) = self.alias_ident() {
+            return Some(&**id);
+        }
+
+        match *self {
+            Type::Function(..) => Some(BuiltinType::Function.symbol()),
+            Type::App(ref id, _) => match **id {
+                Type::Builtin(b) => Some(b.symbol()),
+                _ => None,
+            },
+            Type::Builtin(b) => Some(b.symbol()),
+            _ => None,
+        }
     }
 }
 
@@ -910,6 +1016,31 @@ impl<Id> Commented for ArcType<Id> {
     }
 }
 
+pub fn row_iter<T>(typ: &T) -> RowIterator<T> {
+    RowIterator { typ, current: 0 }
+}
+
+pub fn row_iter_mut<Id, T>(typ: &mut T) -> RowIteratorMut<Id, T> {
+    RowIteratorMut {
+        fields: [].iter_mut(),
+        rest: typ,
+    }
+}
+
+pub fn type_field_iter<T>(typ: &T) -> TypeFieldIterator<T> {
+    TypeFieldIterator { typ, current: 0 }
+}
+
+pub fn remove_forall<'a, Id, T>(typ: &'a T) -> &'a T
+where
+    T: Deref<Target = Type<Id, T>>,
+    Id: 'a,
+{
+    match **typ {
+        Type::Forall(_, ref typ, _) => remove_forall(typ),
+        _ => typ,
+    }
+}
 
 impl<Id> ArcType<Id> {
     pub fn new(typ: Type<Id, ArcType<Id>>) -> ArcType<Id> {
@@ -919,23 +1050,127 @@ impl<Id> ArcType<Id> {
     /// Returns an iterator over all type fields in a record.
     /// `{ Test, Test2, x, y } => [Test, Test2]`
     pub fn type_field_iter(&self) -> TypeFieldIterator<Self> {
-        TypeFieldIterator {
-            typ: self,
-            current: 0,
-        }
+        type_field_iter(self)
     }
 
     /// Returns an iterator over all fields in a record.
     /// `{ Test, Test2, x, y } => [x, y]`
     pub fn row_iter(&self) -> RowIterator<Self> {
-        RowIterator {
-            typ: self,
-            current: 0,
-        }
+        row_iter(self)
     }
 
     pub fn strong_count(typ: &ArcType<Id>) -> usize {
         Arc::strong_count(&typ.typ)
+    }
+
+    pub fn remove_implicit_args(&self) -> &ArcType<Id> {
+        match **self {
+            Type::Function(ArgType::Implicit, _, ref typ) => typ.remove_implicit_args(),
+            _ => self,
+        }
+    }
+
+    pub fn remove_forall(&self) -> &ArcType<Id> {
+        remove_forall(self)
+    }
+
+    pub fn remove_forall_and_implicit_args(&self) -> &ArcType<Id> {
+        match **self {
+            Type::Function(ArgType::Implicit, _, ref typ) => typ.remove_forall_and_implicit_args(),
+            Type::Forall(_, ref typ, _) => typ.remove_forall_and_implicit_args(),
+            _ => self,
+        }
+    }
+
+    pub fn skolemize(&self, named_variables: &mut FnvMap<Id, ArcType<Id>>) -> ArcType<Id>
+    where
+        Id: Clone + Eq + Hash,
+    {
+        let mut typ = self;
+        while let Type::Forall(ref params, ref inner_type, Some(ref vars)) = **typ {
+            let iter = params.iter().zip(vars).map(|(param, var)| {
+                let var = var.as_variable().unwrap();
+                (
+                    param.id.clone(),
+                    Type::skolem(Skolem {
+                        name: param.id.clone(),
+                        id: var.id,
+                        kind: var.kind.clone(),
+                    }),
+                )
+            });
+            named_variables.extend(iter);
+            typ = inner_type;
+        }
+        typ.skolemize_(named_variables)
+            .unwrap_or_else(|| typ.clone())
+    }
+
+    fn skolemize_(&self, named_variables: &mut FnvMap<Id, ArcType<Id>>) -> Option<ArcType<Id>>
+    where
+        Id: Clone + Eq + Hash,
+    {
+        match **self {
+            Type::Generic(ref generic) => named_variables.get(&generic.id).cloned(),
+            _ => walk_move_type_opt(
+                self,
+                &mut ControlVisitation(|typ: &ArcType<Id>| typ.skolemize_(named_variables)),
+            ),
+        }
+    }
+
+    pub fn instantiate_generics(&self, named_variables: &mut FnvMap<Id, ArcType<Id>>) -> ArcType<Id>
+    where
+        Id: Clone + Eq + Hash,
+    {
+        let mut typ = self;
+        while let Type::Forall(ref params, ref inner_type, Some(ref vars)) = **typ {
+            named_variables.extend(
+                params
+                    .iter()
+                    .zip(vars)
+                    .map(|(param, var)| (param.id.clone(), var.clone())),
+            );
+            typ = inner_type;
+        }
+        typ.instantiate_generics_(named_variables)
+            .unwrap_or_else(|| typ.clone())
+    }
+
+    pub fn instantiate_generics_(
+        &self,
+        named_variables: &FnvMap<Id, ArcType<Id>>,
+    ) -> Option<ArcType<Id>>
+    where
+        Id: Clone + Eq + Hash,
+    {
+        match **self {
+            Type::Generic(ref generic) => named_variables.get(&generic.id).cloned(),
+            Type::Forall(ref params, ref typ, ref vars) => {
+                // TODO This clone is inneficient
+                let mut named_variables = named_variables.clone();
+                // forall a . { x : forall a . a -> a } -> a
+                // Should not instantiate the `a -> a` part so we must remove the parameters
+                // before visiting that part
+                for param in params {
+                    named_variables.remove(&param.id);
+                }
+
+                typ.instantiate_generics_(&mut named_variables)
+                    .map(|typ| Type::Forall(params.clone(), typ, vars.clone()).into())
+            }
+            _ => walk_move_type_opt(
+                self,
+                &mut ControlVisitation(|typ: &Self| typ.instantiate_generics_(named_variables)),
+            ),
+        }
+    }
+
+    pub fn forall_scope_iter(&self) -> ForallScopeIter<Id> {
+        ForallScopeIter {
+            typ: self,
+            offset: 0,
+        }
     }
 
     pub fn pretty<'a>(&'a self, arena: &'a Arena<'a>) -> DocBuilder<'a, Arena<'a>>
@@ -943,6 +1178,120 @@ impl<Id> ArcType<Id> {
         Id: AsRef<str>,
     {
         top(self).pretty(&Printer::new(arena, &Source::new("")))
+    }
+}
+
+pub struct ForallScopeIter<'a, Id: 'a> {
+    pub typ: &'a ArcType<Id>,
+    offset: usize,
+}
+
+impl<'a, Id> Iterator for ForallScopeIter<'a, Id> {
+    type Item = (&'a Generic<Id>, &'a ArcType<Id>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match **self.typ {
+            Type::Forall(ref params, ref typ, Some(ref vars)) => {
+                let offset = self.offset;
+                let item = params.get(offset).map(|param| {
+                    self.offset += 1;
+                    (param, &vars[offset])
+                });
+                match item {
+                    Some(_) => item,
+                    None => {
+                        self.typ = typ;
+                        self.next()
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl ArcType {
+    pub fn params_mut(&mut self) -> &mut [Generic<Symbol>] {
+        use std::sync::Arc;
+
+        match *Arc::make_mut(&mut self.typ) {
+            /*
+            // TODO
+            Type::Alias(ref mut alias) => {
+                Arc::make_mut(alias.unresolved_type_mut().typ).params_mut()
+            }
+            */
+            Type::Forall(ref mut params, _, _) => params,
+            Type::App(ref mut id, _) => id.params_mut(),
+            _ => &mut [],
+        }
+    }
+
+    /// Applies a list of arguments to a parameterised type, returning `Some`
+    /// if the substitution was successful.
+    ///
+    /// Example:
+    ///
+    /// ```text
+    /// self = forall e t . | Err e | Ok t
+    /// args = [Error, Option a]
+    /// result = | Err Error | Ok (Option a)
+    /// ```
+    pub fn apply_args(&self, args: &[ArcType]) -> Option<ArcType> {
+        let params = self.params();
+        let mut typ = self.remove_forall().clone();
+
+        // It is ok to take the type only if it is fully applied or if it
+        // the missing argument only appears in order at the end, i.e:
+        //
+        // type Test a b c = Type (a Int) b c
+        //
+        // Test a b == Type (a Int) b
+        // Test a == Type (a Int)
+        // Test == ??? (Impossible to do a sane substitution)
+        match *typ.clone() {
+            Type::App(ref d, ref arg_types) => {
+                let allowed_missing_args = arg_types
+                    .iter()
+                    .rev()
+                    .zip(params.iter().rev())
+                    .take_while(|&(l, r)| match **l {
+                        Type::Generic(ref g) => g == r,
+                        _ => false,
+                    })
+                    .count();
+
+                if params.len() - args.len() <= allowed_missing_args {
+                    // Remove the args at the end of the aliased type
+                    let arg_types: AppVec<_> = arg_types
+                        .iter()
+                        .take(arg_types.len() - (params.len() - args.len()))
+                        .cloned()
+                        .collect();
+                    typ = Type::app(d.clone(), arg_types);
+                } else {
+                    return None;
+                }
+            }
+            _ => if args.len() != params.len() {
+                return None;
+            },
+        }
+
+        Some(walk_move_type(typ.remove_forall().clone(), &mut |typ| {
+            match **typ {
+                Type::Generic(ref generic) => {
+                    // Replace the generic variable with the type from the list
+                    // or if it is not found the make a fresh variable
+                    params
+                        .iter()
+                        .zip(args)
+                        .find(|&(arg, _)| arg.id == generic.id)
+                        .map(|(_, typ)| typ.clone())
+                }
+                _ => None,
+            }
+        }))
     }
 }
 
@@ -1060,6 +1409,42 @@ where
     }
 }
 
+pub struct RowIteratorMut<'a, Id: 'a, T: 'a> {
+    fields: ::std::slice::IterMut<'a, Field<Id, T>>,
+    rest: *mut T,
+}
+
+impl<'a, Id: 'a, T: 'a> Iterator for RowIteratorMut<'a, Id, T>
+where
+    T: DerefMut<Target = Type<Id, T>>,
+{
+    type Item = &'a mut Field<Id, T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(x) = self.fields.next() {
+                return Some(x);
+            }
+            // The lifetime checker can't see that self.rest will be unused after we assign the
+            // contents to it so we must just a raw pointer get around it
+            unsafe {
+                match **self.rest {
+                    Type::Record(ref mut row) | Type::Variant(ref mut row) => self.rest = row,
+                    Type::ExtendRow {
+                        ref mut fields,
+                        ref mut rest,
+                        ..
+                    } => {
+                        self.fields = fields.iter_mut();
+                        self.rest = rest;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+}
+
 pub struct ArgIterator<'a, T: 'a> {
     /// The current type being iterated over. After `None` has been returned this is the return
     /// type.
@@ -1085,6 +1470,40 @@ where
             self.typ = ret;
             arg
         })
+    }
+}
+
+pub struct ImplicitArgIterator<'a, T: 'a> {
+    /// The current type being iterated over. After `None` has been returned this is the return
+    /// type.
+    pub typ: &'a T,
+}
+
+/// Constructs an iterator over a functions arguments
+pub fn implicit_arg_iter<Id, T>(typ: &T) -> ImplicitArgIterator<T>
+where
+    T: Deref<Target = Type<Id, T>>,
+{
+    ImplicitArgIterator { typ: typ }
+}
+
+impl<'a, Id, T> Iterator for ImplicitArgIterator<'a, T>
+where
+    Id: 'a,
+    T: Deref<Target = Type<Id, T>>,
+{
+    type Item = &'a T;
+    fn next(&mut self) -> Option<&'a T> {
+        self.typ
+            .as_function_with_type()
+            .and_then(|(arg_type, arg, ret)| {
+                if arg_type == ArgType::Implicit {
+                    self.typ = ret;
+                    Some(arg)
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -1163,7 +1582,6 @@ impl Prec {
     }
 }
 
-
 fn dt<'a, T>(prec: Prec, typ: &'a T) -> DisplayType<'a, T> {
     DisplayType {
         prec: prec,
@@ -1175,59 +1593,9 @@ fn top<'a, T>(typ: &'a T) -> DisplayType<'a, T> {
     dt(Prec::Top, typ)
 }
 
-pub fn display_type<'a, T>(typ: &'a T) -> TypeFormatter<'a, T> {
-    TypeFormatter {
-        width: 80,
-        typ: typ,
-    }
-}
-
 pub struct DisplayType<'a, T: 'a> {
     prec: Prec,
     typ: &'a T,
-}
-
-pub struct TypeFormatter<'a, T>
-where
-    T: 'a,
-{
-    width: usize,
-    typ: &'a T,
-}
-
-impl<'a, T> TypeFormatter<'a, T> {
-    pub fn new(typ: &'a T) -> Self {
-        TypeFormatter {
-            width: 80,
-            typ: typ,
-        }
-    }
-}
-
-impl<'a, T> TypeFormatter<'a, T> {
-    pub fn width(mut self, width: usize) -> Self {
-        self.width = width;
-        self
-    }
-}
-
-impl<'a, I, T> fmt::Display for TypeFormatter<'a, T>
-where
-    T: Deref<Target = Type<I, T>> + HasSpan + Commented + 'a,
-    I: AsRef<str>,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let arena = Arena::new();
-        let source = Source::new("");
-        let printer = Printer::new(&arena, &source);
-        let mut s = Vec::new();
-        pretty_print(&printer, self.typ)
-            .group()
-            .1
-            .render(self.width, &mut s)
-            .map_err(|_| fmt::Error)?;
-        write!(f, "{}", ::std::str::from_utf8(&s).expect("utf-8"))
-    }
 }
 
 pub trait ToDoc<'a, A, E> {
@@ -1250,7 +1618,7 @@ where
     I: AsRef<str>,
 {
     fn to_doc(&'a self, arena: &'a Arena<'a>, source: &'e Source<'a>) -> DocBuilder<'a, Arena<'a>> {
-        let printer = Printer { arena, source };
+        let printer = Printer::new(arena, source);
         dt(Prec::Top, self).pretty(&printer)
     }
 }
@@ -1269,9 +1637,8 @@ macro_rules! chain {
 impl<'a, I, T> DisplayType<'a, T>
 where
     T: Deref<Target = Type<I, T>> + HasSpan + Commented + 'a,
-    I: 'a,
 {
-    pub fn pretty<'e>(&self, printer: &Printer<'a, 'e>) -> DocBuilder<'a, Arena<'a>>
+    pub fn pretty<'e>(&self, printer: &Printer<'a, 'e, I>) -> DocBuilder<'a, Arena<'a>>
     where
         I: AsRef<str>,
     {
@@ -1281,11 +1648,33 @@ where
 
         let p = self.prec;
         let typ = self.typ;
+
         let doc = match **typ {
             Type::Hole => arena.text("_"),
             Type::Opaque => arena.text("<opaque>"),
+            Type::Forall(ref args, ref typ, _) => {
+                let doc = chain![arena;
+                    chain![arena;
+                        "forall ",
+                        arena.concat(args.iter().map(|arg| {
+                            arena.text(arg.id.as_ref()).append(arena.space())
+                        })),
+                        "."
+                    ].group(),
+                    arena.space(),
+                    top(typ).pretty(printer)
+                ];
+                p.enclose(Prec::Function, arena, doc)
+            }
             Type::Variable(ref var) => arena.text(format!("{}", var.id)),
+            Type::Skolem(ref skolem) => chain![
+                    arena;
+                    skolem.name.as_ref(),
+                    "@",
+                    skolem.id.to_string()
+                ],
             Type::Generic(ref gen) => arena.text(gen.id.as_ref()),
+            Type::Function(..) => self.pretty_function(printer).nest(INDENT),
             Type::App(ref t, ref args) => match self.typ.as_function() {
                 Some(_) => self.pretty_function(printer).nest(INDENT),
                 None => {
@@ -1319,7 +1708,7 @@ where
                             ];
                         }
                     },
-                    _ => panic!("Unexpected type in variant"),
+                    _ => ice!("Unexpected type in variant"),
                 };
 
                 p.enclose(Prec::Constructor, arena, doc).group()
@@ -1377,6 +1766,12 @@ where
                     arena.space()
                 };
 
+                let print_any_field = fields
+                    .iter()
+                    .any(|field| printer.filter(&field.name) != Filter::Drop);
+
+                let mut filtered = false;
+
                 while let Type::ExtendRow {
                     ref types,
                     ref rest,
@@ -1384,19 +1779,27 @@ where
                 } = **typ
                 {
                     for (i, field) in types.iter().enumerate() {
+                        let filter = printer.filter(&field.name);
+                        if filter == Filter::Drop {
+                            filtered = true;
+                            continue;
+                        }
+
                         let f = chain![arena;
                             field.name.as_ref(),
                             arena.space(),
-                            arena.concat(field.typ.args.iter().map(|arg| {
-                                arena.text(arg.id.as_ref()).append(" ")
-                            })),
-                            arena.text("= ")
-                                 .append(top(&field.typ.typ).pretty(printer)),
-                            if i + 1 != types.len() || !fields.is_empty() {
+                            arena.text("= "),
+                            if filter == Filter::RetainKey {
+                                arena.text("...")
+                            } else {
+                                 top(&field.typ.typ).pretty(printer)
+                            },
+                            if i + 1 != types.len() || print_any_field {
                                 arena.text(",")
                             } else {
                                 arena.nil()
-                            }].group();
+                            }
+                        ].group();
                         doc = doc.append(newline.clone()).append(f);
                     }
                     typ = rest;
@@ -1413,7 +1816,17 @@ where
                 } = **typ
                 {
                     for (i, field) in fields.iter().enumerate() {
-                        let mut rhs = top(&field.typ).pretty(printer);
+                        let filter = printer.filter(&field.name);
+                        if filter == Filter::Drop {
+                            filtered = true;
+                            continue;
+                        }
+
+                        let mut rhs = if filter == Filter::RetainKey {
+                            arena.text("...")
+                        } else {
+                            top(&field.typ).pretty(printer)
+                        };
                         match *field.typ {
                             // Records handle nesting on their own
                             Type::Record(_) => (),
@@ -1430,9 +1843,33 @@ where
                                 arena.nil()
                             }].group();
                         doc = doc.append(newline.clone()).append(f);
-                        typ = rest;
                     }
+                    typ = rest;
                 }
+
+                let doc = if filtered {
+                    if doc.1 == arena.nil().1 {
+                        chain![arena;
+                            newline.clone(),
+                            "..."
+                        ]
+                    } else {
+                        chain![arena;
+                            newline.clone(),
+                            "...,",
+                            doc,
+                            if newline.1 == arena.space().1 {
+                                arena.text(",")
+                            } else {
+                                arena.nil()
+                            },
+                            newline.clone(),
+                            "..."
+                        ]
+                    }
+                } else {
+                    doc
+                };
                 match **typ {
                     Type::EmptyRow => doc,
                     _ => doc.append(arena.space())
@@ -1447,7 +1884,7 @@ where
             Type::Alias(ref alias) => arena.text(alias.name.as_ref()),
         };
         match **typ {
-            Type::App(..) | Type::ExtendRow { .. } | Type::Variant(..) => doc,
+            Type::App(..) | Type::ExtendRow { .. } | Type::Variant(..) | Type::Function(..) => doc,
             _ => {
                 let comment = printer.comments_before(typ.span().start);
                 comment.append(doc)
@@ -1455,16 +1892,18 @@ where
         }
     }
 
-    fn pretty_function<'e>(&self, printer: &Printer<'a, 'e>) -> DocBuilder<'a, Arena<'a>>
+    fn pretty_function<'e>(&self, printer: &Printer<'a, 'e, I>) -> DocBuilder<'a, Arena<'a>>
     where
         I: AsRef<str>,
     {
         let arena = printer.arena;
         let p = self.prec;
-        match self.typ.as_function() {
-            Some((arg, ret)) => {
+        match self.typ.as_function_with_type() {
+            Some((arg_type, arg, ret)) => {
                 let doc = chain![arena;
+                    if arg_type == ArgType::Implicit { "[" } else { "" },
                     dt(Prec::Function, arg).pretty(printer).group(),
+                    if arg_type == ArgType::Implicit { "]" } else { "" },
                     printer.space_after(arg.span().end),
                     "-> ",
                     top(ret).pretty_function(printer)
@@ -1478,7 +1917,7 @@ where
 }
 
 pub fn pretty_print<'a, 'e, I, T>(
-    printer: &Printer<'a, 'e>,
+    printer: &Printer<'a, 'e, I>,
     typ: &'a T,
 ) -> DocBuilder<'a, Arena<'a>>
 where
@@ -1488,20 +1927,27 @@ where
     dt(Prec::Top, typ).pretty(printer)
 }
 
-pub fn walk_type<I, T, F>(typ: &T, mut f: F)
+pub fn walk_type<'a, I, T, F>(typ: &'a T, mut f: F)
 where
-    F: FnMut(&T),
-    T: Deref<Target = Type<I, T>>,
+    F: Walker<'a, T>,
+    T: Deref<Target = Type<I, T>> + 'a,
+    I: 'a,
 {
     f.walk(typ)
 }
 
-pub fn walk_type_<I, T, F: ?Sized>(typ: &T, f: &mut F)
+pub fn walk_type_<'a, I, T, F: ?Sized>(typ: &'a T, f: &mut F)
 where
-    F: Walker<T>,
-    T: Deref<Target = Type<I, T>>,
+    F: Walker<'a, T>,
+    T: Deref<Target = Type<I, T>> + 'a,
+    I: 'a,
 {
     match **typ {
+        Type::Forall(_, ref typ, _) => f.walk(typ),
+        Type::Function(_, ref arg, ref ret) => {
+            f.walk(arg);
+            f.walk(ret);
+        }
         Type::App(ref t, ref args) => {
             f.walk(t);
             for a in args {
@@ -1522,14 +1968,56 @@ where
             }
             f.walk(rest);
         }
-        Type::Hole |
-        Type::Opaque |
-        Type::Builtin(_) |
-        Type::Variable(_) |
-        Type::Generic(_) |
-        Type::Ident(_) |
-        Type::Alias(_) |
-        Type::EmptyRow => (),
+        Type::Hole
+        | Type::Opaque
+        | Type::Builtin(_)
+        | Type::Variable(_)
+        | Type::Generic(_)
+        | Type::Skolem(_)
+        | Type::Ident(_)
+        | Type::Alias(_)
+        | Type::EmptyRow => (),
+    }
+}
+
+pub fn walk_type_mut<I, T, F: ?Sized>(typ: &mut T, f: &mut F)
+where
+    F: WalkerMut<T>,
+    T: DerefMut<Target = Type<I, T>>,
+{
+    match **typ {
+        Type::Forall(_, ref mut typ, _) => f.walk_mut(typ),
+        Type::Function(_, ref mut arg, ref mut ret) => {
+            f.walk_mut(arg);
+            f.walk_mut(ret);
+        }
+        Type::App(ref mut t, ref mut args) => {
+            f.walk_mut(t);
+            for a in args {
+                f.walk_mut(a);
+            }
+        }
+        Type::Record(ref mut row) | Type::Variant(ref mut row) => f.walk_mut(row),
+        Type::ExtendRow {
+            // Can't visit types mutably as they are always shared
+            types: _,
+            ref mut fields,
+            ref mut rest,
+        } => {
+            for field in fields {
+                f.walk_mut(&mut field.typ);
+            }
+            f.walk_mut(rest);
+        }
+        Type::Hole
+        | Type::Opaque
+        | Type::Builtin(_)
+        | Type::Variable(_)
+        | Type::Generic(_)
+        | Type::Skolem(_)
+        | Type::Ident(_)
+        | Type::Alias(_)
+        | Type::EmptyRow => (),
     }
 }
 
@@ -1555,8 +2043,8 @@ pub trait TypeVisitor<I, T> {
     }
 }
 
-pub trait Walker<T> {
-    fn walk(&mut self, typ: &T);
+pub trait Walker<'a, T> {
+    fn walk(&mut self, typ: &'a T);
 }
 
 impl<I, T, F: ?Sized> TypeVisitor<I, T> for F
@@ -1575,7 +2063,7 @@ where
 }
 
 /// Wrapper type which allows functions to control how to traverse the members of the type
-pub struct ControlVisitation<F>(pub F);
+pub struct ControlVisitation<F: ?Sized>(pub F);
 
 impl<F, I, T> TypeVisitor<I, T> for ControlVisitation<F>
 where
@@ -1590,14 +2078,40 @@ where
     }
 }
 
-impl<I, T, F: ?Sized> Walker<T> for F
+impl<'a, F, T> Walker<'a, T> for ControlVisitation<F>
 where
-    F: FnMut(&T),
-    T: Deref<Target = Type<I, T>>,
+    F: ?Sized + FnMut(&'a T),
+    T: 'a,
 {
-    fn walk(&mut self, typ: &T) {
+    fn walk(&mut self, typ: &'a T) {
+        (self.0)(typ)
+    }
+}
+
+impl<'a, I, T, F: ?Sized> Walker<'a, T> for F
+where
+    F: FnMut(&'a T),
+    T: Deref<Target = Type<I, T>> + 'a,
+    I: 'a,
+{
+    fn walk(&mut self, typ: &'a T) {
         self(typ);
         walk_type_(typ, self)
+    }
+}
+
+pub trait WalkerMut<T> {
+    fn walk_mut(&mut self, typ: &mut T);
+}
+
+impl<I, T, F: ?Sized> WalkerMut<T> for F
+where
+    F: FnMut(&mut T),
+    T: DerefMut<Target = Type<I, T>>,
+{
+    fn walk_mut(&mut self, typ: &mut T) {
+        self(typ);
+        walk_type_mut(typ, self)
     }
 }
 
@@ -1611,6 +2125,15 @@ where
     f.visit(&typ).unwrap_or(typ)
 }
 
+pub fn visit_type_opt<F: ?Sized, I, T>(typ: &T, f: &mut F) -> Option<T>
+where
+    F: TypeVisitor<I, T>,
+    T: Deref<Target = Type<I, T>> + From<Type<I, T>> + Clone,
+    I: Clone,
+{
+    f.visit(typ)
+}
+
 pub fn walk_move_type_opt<F: ?Sized, I, T>(typ: &Type<I, T>, f: &mut F) -> Option<T>
 where
     F: TypeVisitor<I, T>,
@@ -1618,6 +2141,16 @@ where
     I: Clone,
 {
     match *typ {
+        Type::Forall(ref args, ref typ, ref vars) => f.visit(typ)
+            .map(|typ| T::from(Type::Forall(args.clone(), typ, vars.clone()))),
+
+        Type::Function(arg_type, ref arg, ref ret) => {
+            let new_arg = f.visit(arg);
+            let new_ret = f.visit(ret);
+            merge(arg, new_arg, ret, new_ret, |arg, ret| {
+                T::from(Type::Function(arg_type, arg, ret))
+            })
+        }
         Type::App(ref id, ref args) => {
             let new_args = walk_move_types(args, |t| f.visit(t));
             merge(id, f.visit(id), args, new_args, Type::app)
@@ -1638,14 +2171,15 @@ where
                 Type::extend_row(types.clone(), fields, rest)
             })
         }
-        Type::Hole |
-        Type::Opaque |
-        Type::Builtin(_) |
-        Type::Variable(_) |
-        Type::Generic(_) |
-        Type::Ident(_) |
-        Type::Alias(_) |
-        Type::EmptyRow => None,
+        Type::Hole
+        | Type::Opaque
+        | Type::Builtin(_)
+        | Type::Variable(_)
+        | Type::Skolem(_)
+        | Type::Generic(_)
+        | Type::Ident(_)
+        | Type::Alias(_)
+        | Type::EmptyRow => None,
     }
 }
 
@@ -1687,20 +2221,17 @@ where
     }
 }
 
-pub fn translate_alias<Id, T, U>(
-    cache: &TypeCache<Id, U>,
-    alias: &AliasData<Id, T>,
-) -> AliasData<Id, U>
+pub fn translate_alias<Id, T, U, F>(alias: &AliasData<Id, T>, mut translate: F) -> AliasData<Id, U>
 where
     T: Deref<Target = Type<Id, T>>,
     U: From<Type<Id, U>> + Clone,
     Id: Clone,
+    F: FnMut(&T) -> U,
 {
-    AliasData::new(
-        alias.name.clone(),
-        alias.args.clone(),
-        translate_type(cache, &alias.typ),
-    )
+    AliasData {
+        name: alias.name.clone(),
+        typ: translate(&alias.typ),
+    }
 }
 
 pub fn translate_type<Id, T, U>(cache: &TypeCache<Id, U>, typ: &Type<Id, T>) -> U
@@ -1709,13 +2240,42 @@ where
     U: From<Type<Id, U>> + Clone,
     Id: Clone,
 {
+    translate_type_with(cache, typ, |t| translate_type(cache, t))
+}
+
+pub fn translate_type_with<Id, T, U, F>(
+    cache: &TypeCache<Id, U>,
+    typ: &Type<Id, T>,
+    mut translate: F,
+) -> U
+where
+    T: Deref<Target = Type<Id, T>>,
+    U: From<Type<Id, U>> + Clone,
+    Id: Clone,
+    F: FnMut(&T) -> U,
+{
     match *typ {
+        Type::Function(arg_type, ref arg, ref ret) => {
+            U::from(Type::Function(arg_type, translate(arg), translate(ret)))
+        }
         Type::App(ref f, ref args) => Type::app(
-            translate_type(cache, f),
-            args.iter().map(|typ| translate_type(cache, typ)).collect(),
+            translate(f),
+            args.iter().map(|typ| translate(typ)).collect(),
         ),
-        Type::Record(ref row) => U::from(Type::Record(translate_type(cache, row))),
-        Type::Variant(ref row) => U::from(Type::Variant(translate_type(cache, row))),
+        Type::Record(ref row) => U::from(Type::Record(translate(row))),
+        Type::Variant(ref row) => U::from(Type::Variant(translate(row))),
+        Type::Forall(ref params, ref typ, ref skolem) => U::from(Type::Forall(
+            params.clone(),
+            translate(typ),
+            skolem
+                .as_ref()
+                .map(|ts| ts.iter().map(|t| translate(t)).collect()),
+        )),
+        Type::Skolem(ref skolem) => U::from(Type::Skolem(Skolem {
+            name: skolem.name.clone(),
+            id: skolem.id.clone(),
+            kind: skolem.kind.clone(),
+        })),
         Type::ExtendRow {
             ref types,
             ref fields,
@@ -1723,20 +2283,16 @@ where
         } => Type::extend_row(
             types
                 .iter()
-                .map(|field| {
-                    Field {
-                        name: field.name.clone(),
-                        typ: Alias::from(translate_alias(cache, &field.typ)),
-                    }
+                .map(|field| Field {
+                    name: field.name.clone(),
+                    typ: Alias::from(translate_alias(&field.typ, &mut translate)),
                 })
                 .collect(),
             fields
                 .iter()
-                .map(|field| {
-                    Field {
-                        name: field.name.clone(),
-                        typ: translate_type(cache, &field.typ),
-                    }
+                .map(|field| Field {
+                    name: field.name.clone(),
+                    typ: translate(&field.typ),
                 })
                 .collect(),
             translate_type(cache, rest),
@@ -1747,12 +2303,7 @@ where
         Type::Variable(ref var) => Type::variable(var.clone()),
         Type::Generic(ref gen) => Type::generic(gen.clone()),
         Type::Ident(ref id) => Type::ident(id.clone()),
-        // This is not quite correct but currently only `AstType` -> `ArcType` translations are needed
-        // so this will not be used
-        Type::Alias(ref alias) => U::from(Type::Alias(AliasRef {
-            index: 0,
-            group: Arc::new(vec![translate_alias(cache, alias)]),
-        })),
+        Type::Alias(_) => ice!("translate_type called on alias"),
         Type::EmptyRow => cache.empty_row(),
     }
 }

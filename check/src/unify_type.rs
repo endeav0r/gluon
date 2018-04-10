@@ -5,14 +5,15 @@ use base::error::Errors;
 use base::fnv::FnvMap;
 use base::merge;
 use base::kind::ArcKind;
-use base::types::{self, AppVec, ArcType, Field, Generic, Type, TypeEnv, TypeVariable};
+use base::types::{self, AppVec, ArcType, ArgType, BuiltinType, Field, Filter, Generic, Skolem,
+                  Type, TypeEnv, TypeFormatter, TypeVariable};
 use base::symbol::{Symbol, SymbolRef};
 use base::resolve::{self, Error as ResolveError};
 use base::scoped_map::ScopedMap;
 
 use unify;
-use unify::{Error as UnifyError, Fresh, GenericVariant, Unifiable, Unifier};
-use substitution::{Constraints, Substitutable, Substitution, Variable, VariableFactory};
+use unify::{Error as UnifyError, GenericVariant, Unifiable, Unifier};
+use substitution::{Substitutable, Substitution, Variable, VariableFactory};
 
 impl VariableFactory for ArcKind {
     type Variable = TypeVariable;
@@ -43,12 +44,7 @@ pub struct State<'a> {
     reduced_aliases: Vec<Symbol>,
     subs: &'a Substitution<ArcType>,
     record_context: Option<(ArcType, ArcType)>,
-}
-
-impl<'a> Fresh for State<'a> {
-    fn fresh(&self) -> Self {
-        State::new(self.env, self.subs)
-    }
+    pub in_alias: bool,
 }
 
 impl<'a> State<'a> {
@@ -58,13 +54,18 @@ impl<'a> State<'a> {
             reduced_aliases: Vec::new(),
             subs: subs,
             record_context: None,
+            in_alias: false,
         }
     }
 
-    fn remove_aliases(&mut self, typ: &ArcType) -> Result<Option<ArcType>, TypeError<Symbol>> {
+    fn remove_aliases(
+        &mut self,
+        subs: &Substitution<ArcType>,
+        typ: &ArcType,
+    ) -> Result<Option<ArcType>, TypeError<Symbol>> {
         if let Some(alias_id) = typ.alias_ident() {
             if self.reduced_aliases.iter().any(|name| name == alias_id) {
-                return Err(TypeError::SelfRecursive(alias_id.clone()));
+                return Err(TypeError::SelfRecursiveAlias(alias_id.clone()));
             }
             self.reduced_aliases.push(alias_id.clone());
         }
@@ -72,9 +73,23 @@ impl<'a> State<'a> {
         match resolve::remove_alias(&self.env, typ)? {
             Some(mut typ) => {
                 loop {
+                    typ = types::walk_move_type(typ.clone(), &mut |typ| match **typ {
+                        Type::Forall(_, _, None) => {
+                            let typ = new_skolem_scope(subs, typ);
+                            if let Type::Forall(_, _, Some(ref vars)) = *typ {
+                                for var in vars {
+                                    if let Type::Variable(ref var) = **var {
+                                        subs.set_level(var.id, 0);
+                                    }
+                                }
+                            }
+                            Some(typ)
+                        }
+                        _ => None,
+                    });
                     if let Some(alias_id) = typ.alias_ident() {
                         if self.reduced_aliases.iter().any(|name| name == alias_id) {
-                            return Err(TypeError::SelfRecursive(alias_id.clone()));
+                            return Err(TypeError::SelfRecursiveAlias(alias_id.clone()));
                         }
                         self.reduced_aliases.push(alias_id.clone());
                     }
@@ -95,7 +110,7 @@ impl<'a> State<'a> {
 pub enum TypeError<I> {
     UndefinedType(I),
     FieldMismatch(I, I),
-    SelfRecursive(I),
+    SelfRecursiveAlias(I),
     UnableToGeneralize(I),
     MissingFields(ArcType<I>, Vec<I>),
 }
@@ -104,6 +119,7 @@ impl From<ResolveError> for TypeError<Symbol> {
     fn from(error: ResolveError) -> TypeError<Symbol> {
         match error {
             ResolveError::UndefinedType(id) => TypeError::UndefinedType(id),
+            ResolveError::SelfRecursiveAlias(id) => TypeError::SelfRecursiveAlias(id),
         }
     }
 }
@@ -113,15 +129,76 @@ where
     I: fmt::Display + AsRef<str>,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let filter = self.make_filter();
+        self.filter_fmt(&*filter, f)
+    }
+}
+
+pub fn similarity_filter<'a, I>(typ: &'a ArcType<I>, fields: &'a [I]) -> Box<Fn(&I) -> Filter + 'a>
+where
+    I: AsRef<str>,
+{
+    let mut field_similarity = typ.type_field_iter()
+        .map(|field| &field.name)
+        .chain(typ.row_iter().map(|field| &field.name))
+        .map(|field_in_type| {
+            let similarity = fields
+                .iter()
+                .map(|missing_field| {
+                    ::strsim::jaro_winkler(missing_field.as_ref(), field_in_type.as_ref())
+                })
+                .max_by(|l, r| l.partial_cmp(&r).unwrap())
+                .expect("At least one missing field");
+            (field_in_type, (similarity * 1000000.) as i32)
+        })
+        .collect::<Vec<_>>();
+    field_similarity.sort_by_key(|t| ::std::cmp::Reverse(t.1));
+
+    Box::new(move |field: &I| {
+        // Keep the fields that were missing as-is (with full types)
+        if fields.iter().any(|f| f.as_ref() == field.as_ref()) {
+            Filter::Retain
+        } else if field_similarity
+            .iter()
+            .take(3)
+            .any(|t| t.0.as_ref() == field.as_ref())
+        {
+            Filter::RetainKey
+        } else {
+            Filter::Drop
+        }
+    })
+}
+
+impl<I> TypeError<I>
+where
+    I: fmt::Display + AsRef<str>,
+{
+    pub fn make_filter<'a>(&'a self) -> Box<Fn(&I) -> Filter + 'a> {
+        match *self {
+            TypeError::FieldMismatch(ref l, ref r) => Box::new(move |field| {
+                if [l, r].iter().any(|f| f.as_ref() == field.as_ref()) {
+                    Filter::Retain
+                } else {
+                    Filter::Drop
+                }
+            }),
+            TypeError::UndefinedType(_) => Box::new(|_| Filter::Retain),
+            TypeError::SelfRecursiveAlias(_) => Box::new(|_| Filter::Retain),
+            TypeError::UnableToGeneralize(_) => Box::new(|_| Filter::Retain),
+            TypeError::MissingFields(ref typ, ref fields) => similarity_filter(typ, fields),
+        }
+    }
+
+    pub fn filter_fmt(&self, filter: &Fn(&I) -> Filter, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             TypeError::FieldMismatch(ref l, ref r) => write!(
                 f,
                 "Field names in record do not match.\n\tExpected: {}\n\tFound: {}",
-                l,
-                r
+                l, r
             ),
             TypeError::UndefinedType(ref id) => write!(f, "Type `{}` does not exist.", id),
-            TypeError::SelfRecursive(ref id) => write!(
+            TypeError::SelfRecursiveAlias(ref id) => write!(
                 f,
                 "The use of self recursion in type `{}` could not be unified.",
                 id
@@ -133,7 +210,11 @@ where
                 id
             ),
             TypeError::MissingFields(ref typ, ref fields) => {
-                write!(f, "The type `{}` lacks the following fields: ", typ)?;
+                write!(
+                    f,
+                    "The type `{}` lacks the following fields: ",
+                    TypeFormatter::new(typ).filter(filter)
+                )?;
                 for (i, field) in fields.iter().enumerate() {
                     let sep = match i {
                         0 => "",
@@ -171,20 +252,19 @@ impl Substitutable for ArcType<Symbol> {
         }
     }
 
-    fn traverse<F>(&self, f: &mut F)
+    fn traverse<'a, F>(&'a self, f: &mut F)
     where
-        F: types::Walker<Self>,
+        F: types::Walker<'a, Self>,
     {
         types::walk_type_(self, f)
     }
 
-    fn instantiate(
-        &self,
-        subs: &Substitution<Self>,
-        constraints: &FnvMap<Symbol, Constraints<Self>>,
-    ) -> Self {
-        let mut named_variables = FnvMap::default();
-        instantiate_generic_variables(&mut named_variables, subs, constraints, self)
+    fn instantiate(&self, subs: &Substitution<Self>) -> Self {
+        new_skolem_scope(subs, self).instantiate_generics(&mut FnvMap::default())
+    }
+
+    fn on_union(&self) -> Option<&Self> {
+        unpack_single_forall(self)
     }
 }
 
@@ -197,7 +277,7 @@ impl<'a> Unifiable<State<'a>> for ArcType {
         unifier: &mut UnifierState<'a, U>,
     ) -> Result<Option<Self>, Error<Symbol>>
     where
-        U: Unifier<State<'a>, Self>,
+        UnifierState<'a, U>: Unifier<State<'a>, Self>,
     {
         let reduced_aliases = unifier.state.reduced_aliases.len();
         debug!("{} <=> {}", self, other);
@@ -213,6 +293,10 @@ impl<'a> Unifiable<State<'a>> for ArcType {
             }
             Err(()) => (),
         }
+        let old_in_alias = unifier.state.in_alias;
+        if through_alias {
+            unifier.state.in_alias = true;
+        }
         let result = do_zip_match(unifier, l, r).map(|mut unified_type| {
             // If the match was done through an alias the unified type is likely less precise than
             // `self` or `other`.
@@ -222,6 +306,7 @@ impl<'a> Unifiable<State<'a>> for ArcType {
             }
             unified_type
         });
+        unifier.state.in_alias = old_in_alias;
         unifier.state.reduced_aliases.truncate(reduced_aliases);
         result
     }
@@ -233,10 +318,47 @@ fn do_zip_match<'a, U>(
     actual: &ArcType,
 ) -> Result<Option<ArcType>, Error<Symbol>>
 where
-    U: Unifier<State<'a>, ArcType>,
+    UnifierState<'a, U>: Unifier<State<'a>, ArcType>,
 {
     debug!("Unifying:\n{} <=> {}", expected, actual);
     match (&**expected, &**actual) {
+        (
+            &Type::Function(l_arg_type, ref l_arg, ref l_ret),
+            &Type::Function(r_arg_type, ref r_arg, ref r_ret),
+        ) if l_arg_type == r_arg_type =>
+        {
+            let arg = unifier.try_match(l_arg, r_arg);
+            let ret = unifier.try_match(l_ret, r_ret);
+            Ok(merge::merge(l_arg, arg, l_ret, ret, |arg, ret| {
+                ArcType::from(Type::Function(l_arg_type, arg, ret))
+            }))
+        }
+        (
+            &Type::Function(ArgType::Explicit, ref l_arg, ref l_ret),
+            &Type::App(ref r, ref r_args),
+        ) => {
+            let l_args = collect![l_arg.clone(), l_ret.clone()];
+            Ok(unify_app(
+                unifier,
+                &Type::builtin(BuiltinType::Function),
+                &l_args,
+                r,
+                r_args,
+            ))
+        }
+        (
+            &Type::App(ref l, ref l_args),
+            &Type::Function(ArgType::Explicit, ref r_arg, ref r_ret),
+        ) => {
+            let r_args = collect![r_arg.clone(), r_ret.clone()];
+            Ok(unify_app(
+                unifier,
+                l,
+                l_args,
+                &Type::builtin(BuiltinType::Function),
+                &r_args,
+            ))
+        }
         (&Type::App(ref l, ref l_args), &Type::App(ref r, ref r_args)) => {
             Ok(unify_app(unifier, l, l_args, r, r_args))
         }
@@ -252,12 +374,11 @@ where
                     rest: ref r_rest,
                     ..
                 },
-            ) => if l_row.len() == r_row.len() &&
-                l_row
+            ) => if l_row.len() == r_row.len()
+                && l_row
                     .iter()
                     .zip(r_row)
-                    .all(|(l, r)| l.name.name_eq(&r.name)) &&
-                l_rest == r_rest
+                    .all(|(l, r)| l.name.name_eq(&r.name)) && l_rest == r_rest
             {
                 let iter = l_row.iter().zip(r_row);
                 let new_fields = merge::merge_tuple_iter(iter, |l, r| {
@@ -265,9 +386,7 @@ where
                         .try_match(&l.typ, &r.typ)
                         .map(|typ| Field::new(l.name.clone(), typ))
                 });
-                Ok(
-                    new_fields.map(|fields| Type::poly_variant(fields, l_rest.clone())),
-                )
+                Ok(new_fields.map(|fields| Type::poly_variant(fields, l_rest.clone())))
             } else {
                 Err(UnifyError::TypeMismatch(expected.clone(), actual.clone()))
             },
@@ -299,8 +418,8 @@ where
         ) => {
             // When the field names of both rows match exactly we special case
             // unification to maximize sharing through `merge` and `walk_move_type`
-            if l_args.len() == r_args.len() &&
-                l_args
+            if l_args.len() == r_args.len()
+                && l_args
                     .iter()
                     .zip(r_args)
                     .all(|(l, r)| l.name.name_eq(&r.name)) && l_types == r_types
@@ -354,10 +473,79 @@ where
                 unify_rows(unifier, expected, actual)
             }
         }
+
+        (&Type::ExtendRow { .. }, &Type::EmptyRow) | (&Type::EmptyRow, &Type::ExtendRow { .. }) => {
+            unify_rows(unifier, expected, actual)
+        }
+
         (&Type::Ident(ref id), &Type::Alias(ref alias)) if *id == alias.name => {
             Ok(Some(actual.clone()))
         }
         (&Type::Alias(ref alias), &Type::Ident(ref id)) if *id == alias.name => Ok(None),
+
+        (&Type::Forall(ref params, _, Some(ref vars)), &Type::Forall(_, _, Some(_))) => {
+            let mut named_variables = FnvMap::default();
+
+            if unifier.state.in_alias {
+                let l = expected.skolemize(&mut named_variables);
+                named_variables.clear();
+                let r = actual.skolemize(&mut named_variables);
+
+                Ok(unifier.try_match_res(&l, &r)?.map(|inner_type| {
+                    reconstruct_forall(unifier.state.subs, params, inner_type, vars)
+                }))
+            } else {
+                let mut expected_iter = expected.forall_scope_iter();
+                named_variables.extend(expected_iter.by_ref().map(|(l_param, l_var)| {
+                    let l_var = l_var.as_variable().unwrap();
+                    (
+                        l_param.id.clone(),
+                        Type::skolem(Skolem {
+                            name: l_param.id.clone(),
+                            id: l_var.id,
+                            kind: l_var.kind.clone(),
+                        }),
+                    )
+                }));
+                let l = expected_iter.typ.skolemize(&mut named_variables);
+
+                named_variables.clear();
+                let mut actual_iter = actual.forall_scope_iter();
+                named_variables.extend(expected_iter.by_ref().zip(actual_iter.by_ref()).map(
+                    |((_, l_var), (r_param, r_var))| {
+                        let l_var = l_var.as_variable().unwrap();
+                        let r_var = r_var.as_variable().unwrap();
+                        (
+                            r_param.id.clone(),
+                            Type::skolem(Skolem {
+                                name: r_param.id.clone(),
+                                id: l_var.id,
+                                kind: r_var.kind.clone(),
+                            }),
+                        )
+                    },
+                ));
+                let r = actual_iter.typ.skolemize(&mut named_variables);
+
+                Ok(unifier.try_match_res(&l, &r)?.map(|inner_type| {
+                    reconstruct_forall(unifier.state.subs, params, inner_type, vars)
+                }))
+            }
+        }
+
+        (&Type::Forall(ref params, _, Some(ref vars)), _) => {
+            let l = expected.skolemize(&mut FnvMap::default());
+            Ok(unifier
+                .try_match_res(&l, &actual)?
+                .map(|inner_type| reconstruct_forall(unifier.state.subs, params, inner_type, vars)))
+        }
+
+        (_, &Type::Forall(_, _, Some(_))) => {
+            let r = actual.skolemize(&mut FnvMap::default());
+            Ok(unifier.try_match_res(expected, &r)?)
+        }
+
+        (&Type::Skolem(ref l), &Type::Skolem(ref r)) if r.id == l.id => Ok(None),
 
         // Successful unification!
         (lhs, rhs) if lhs == rhs => Ok(None),
@@ -365,35 +553,58 @@ where
         // Last ditch attempt to unify the types expanding the aliases
         // (if the types are alias types).
         (_, _) => {
-            let lhs = unifier
+            let subs = unifier.state.subs;
+            let lhs_base = unifier
                 .state
-                .remove_aliases(expected)
+                .remove_aliases(subs, expected)
                 .map_err(UnifyError::Other)?;
-            let rhs = unifier
+            let rhs_base = unifier
                 .state
-                .remove_aliases(actual)
+                .remove_aliases(subs, actual)
                 .map_err(UnifyError::Other)?;
 
-            match (&lhs, &rhs) {
+            match (&lhs_base, &rhs_base) {
                 (&None, &None) => {
-                    debug!("Unify error: {} <=> {}", expected, actual);
+                    debug!("Unify error: {:?} <=> {:?}", expected, actual);
                     Err(UnifyError::TypeMismatch(expected.clone(), actual.clone()))
                 }
                 (_, _) => {
-                    let lhs = lhs.as_ref().unwrap_or(expected);
-                    let rhs = rhs.as_ref().unwrap_or(actual);
-                    // FIXME Maybe always return `None` here since the types before we removed the
-                    // aliases are probably more specific.
-                    unifier.try_match_res(lhs, rhs).map_err(|_err| {
-                        // We failed to unify `lhs` and `rhs` at the spine. Replace that error with
-                        // a mismatch between the aliases instead as that should be less verbose
-                        // Example
-                        // type A = | A Int
-                        // type B = | B Float
-                        // A <=> B
-                        // Gives `A` != `B` instead of `| A Int` != `| B Float`
-                        UnifyError::TypeMismatch(expected.clone(), actual.clone())
-                    })
+                    let lhs = lhs_base.as_ref().unwrap_or(expected);
+                    let rhs = rhs_base.as_ref().unwrap_or(actual);
+
+                    let old_in_alias = unifier.state.in_alias;
+                    unifier.state.in_alias = true;
+
+                    let result = unifier
+                        .try_match_res(lhs, rhs)
+                        .map(|typ| {
+                            if unifier.allow_returned_type_replacement() || typ.is_none() {
+                                // Always ignore the type returned from try_match_res since it will be less specialized than
+                                // `lhs` or `rhs`. If `lhs` is an alias we return `None` since `lhs` will be chosen if necessary anyway
+                                // otherwise if `lhs` is not an alias then `rhs` must have been so chose `rhs/actual`
+                                if lhs_base.is_some() {
+                                    None
+                                } else {
+                                    Some(actual.clone())
+                                }
+                            } else {
+                                typ
+                            }
+                        })
+                        .map_err(|_err| {
+                            // We failed to unify `lhs` and `rhs` at the spine. Replace that error with
+                            // a mismatch between the aliases instead as that should be less verbose
+                            // Example
+                            // type A = | A Int
+                            // type B = | B Float
+                            // A <=> B
+                            // Gives `A` != `B` instead of `| A Int` != `| B Float`
+                            UnifyError::TypeMismatch(expected.clone(), actual.clone())
+                        });
+
+                    unifier.state.in_alias = old_in_alias;
+
+                    result
                 }
             }
         }
@@ -408,7 +619,7 @@ fn unify_app<'a, U>(
     r_args: &AppVec<ArcType>,
 ) -> Option<ArcType>
 where
-    U: Unifier<State<'a>, ArcType>,
+    UnifierState<'a, U>: Unifier<State<'a>, ArcType>,
 {
     use std::cmp::Ordering::*;
     // Applications are curried `a b c d` == `((a b) c) d` we need to unify the last
@@ -494,7 +705,7 @@ fn unify_rows<'a, U>(
     r: &ArcType,
 ) -> Result<Option<ArcType>, Error<Symbol>>
 where
-    U: Unifier<State<'a>, ArcType>,
+    UnifierState<'a, U>: Unifier<State<'a>, ArcType>,
 {
     let subs = unifier.state.subs;
     let (types_missing_from_left, types_both, types_missing_from_right) =
@@ -610,7 +821,7 @@ fn find_alias<'a, U>(
     r_id: &SymbolRef,
 ) -> Result<Option<ArcType>, ()>
 where
-    U: Unifier<State<'a>, ArcType>,
+    UnifierState<'a, U>: Unifier<State<'a>, ArcType>,
 {
     let reduced_aliases = unifier.state.reduced_aliases.len();
     let result = find_alias_(unifier, l, r_id);
@@ -630,7 +841,7 @@ fn find_alias_<'a, U>(
     r_id: &SymbolRef,
 ) -> Result<Option<ArcType>, ()>
 where
-    U: Unifier<State<'a>, ArcType>,
+    UnifierState<'a, U>: Unifier<State<'a>, ArcType>,
 {
     let mut did_alias = false;
     loop {
@@ -688,7 +899,7 @@ fn find_common_alias<'a, U>(
     through_alias: &mut bool,
 ) -> Result<(ArcType, ArcType), ()>
 where
-    U: Unifier<State<'a>, ArcType>,
+    UnifierState<'a, U>: Unifier<State<'a>, ArcType>,
 {
     let mut l = expected.clone();
     if let Some(r_id) = actual.name() {
@@ -713,41 +924,89 @@ where
     Ok((l, r))
 }
 
-/// Replaces all instances `Type::Generic` in `typ` with fresh type variables (`Type::Variable`)
-pub fn instantiate_generic_variables(
-    named_variables: &mut FnvMap<Symbol, ArcType>,
-    subs: &Substitution<ArcType>,
-    constraints: &FnvMap<Symbol, Constraints<ArcType>>,
-    typ: &ArcType,
-) -> ArcType {
-    use std::collections::hash_map::Entry;
-
-    types::walk_move_type(typ.clone(), &mut |typ| match **typ {
-        Type::Generic(ref generic) => {
-            let var = match named_variables.entry(generic.id.clone()) {
-                Entry::Vacant(entry) => {
-                    let constraint = constraints.get(&generic.id).cloned();
-                    entry
-                        .insert(subs.new_constrained_var(
-                            constraint.map(|constraint| (generic.id.clone(), constraint.clone())),
-                        ))
-                        .clone()
-                }
-                Entry::Occupied(entry) => entry.get().clone(),
-            };
-
-            let mut var = (*var).clone();
-            if let Type::Variable(ref mut var) = var {
-                var.kind = generic.kind.clone();
+// HACK
+// Currently the substitution assumes that once a variable has been unified to a
+// concrete type it cannot be unified to another type later.
+//
+// This is true in ever case except `forall a . a`, while `forall a . a` looks
+// like a concrete type it can actually turn into just an unknown type variable
+// breaking this assumption (by replacing `a` with the bound unkown variable).
+//
+// So to guard against this we unpack the forall into the unknown variable which
+// might cause some valid programs fail to compile but should not let invalid
+// programs compile
+fn unpack_single_forall(l: &ArcType) -> Option<&ArcType> {
+    match **l {
+        Type::Forall(ref params, ref l_inner, Some(ref vars)) if params.len() == 1 => {
+            match **l_inner {
+                Type::Skolem(ref skolem) if skolem.name == params[0].id => Some(&vars[0]),
+                // FIXME
+                // Since `Type::Forall` contains `Some` the `Generic` should have
+                // been skolemized
+                Type::Generic(ref gen) if gen.id == params[0].id => Some(&vars[0]),
+                _ => None,
             }
-
-            Some(ArcType::from(var))
         }
         _ => None,
-    })
+    }
 }
 
-pub fn merge_signature(
+/// Replaces all instances `Type::Generic` in `typ` with fresh type variables (`Type::Variable`)
+pub fn new_skolem_scope(subs: &Substitution<ArcType>, typ: &ArcType) -> ArcType {
+    let mut id_to_var = FnvMap::default();
+    let mut id_to_constraint = FnvMap::default();
+
+    let new_type = types::walk_move_type(typ.clone(), &mut |typ| {
+        if let Type::Forall(ref params, ref inner_type, None) = **typ {
+            let mut skolem = Vec::new();
+            for param in params {
+                let var = subs.new_var_fn(|id| {
+                    id_to_var.insert(param.id.clone(), id);
+                    Type::variable(TypeVariable {
+                        id,
+                        kind: param.kind.clone(),
+                    })
+                });
+                skolem.push(var.clone());
+            }
+            Some(ArcType::from(Type::Forall(
+                params.clone(),
+                inner_type.clone(),
+                Some(skolem),
+            )))
+        } else {
+            if let Type::Function(ArgType::Implicit, ref arg, _) = **typ {
+                types::walk_move_type(arg.clone(), &mut |typ| {
+                    if let Type::Generic(ref gen) = **typ {
+                        id_to_constraint
+                            .entry(gen.id.clone())
+                            .or_insert(Vec::new())
+                            .push(arg.clone());
+                    }
+                    None
+                });
+            }
+            None
+        }
+    });
+    new_type
+}
+
+pub fn top_skolem_scope(subs: &Substitution<ArcType>, typ: &ArcType) -> ArcType {
+    if let Type::Forall(ref params, ref inner_type, None) = **typ {
+        let skolem = params.iter().map(|_| subs.new_var()).collect();
+        ArcType::from(Type::Forall(
+            params.clone(),
+            inner_type.clone(),
+            Some(skolem),
+        ))
+    } else {
+        typ.clone()
+    }
+}
+
+/// Performs subsumption between `l` and `r` (`r` is-a `l`)
+pub fn subsumes(
     subs: &Substitution<ArcType>,
     variables: &mut ScopedMap<Symbol, ArcType>,
     level: u32,
@@ -755,9 +1014,10 @@ pub fn merge_signature(
     l: &ArcType,
     r: &ArcType,
 ) -> Result<ArcType, Errors<Error<Symbol>>> {
+    debug!("Subsume {} <=> {}", l, r);
     let mut unifier = UnifierState {
         state: state,
-        unifier: Merge {
+        unifier: Subsume {
             subs: subs,
             variables: variables,
             errors: Errors::new(),
@@ -773,78 +1033,142 @@ pub fn merge_signature(
     }
 }
 
-struct Merge<'e> {
+struct Subsume<'e> {
     subs: &'e Substitution<ArcType>,
-    variables: &'e ScopedMap<Symbol, ArcType>,
+    variables: &'e mut ScopedMap<Symbol, ArcType>,
     errors: Errors<Error<Symbol>>,
     level: u32,
 }
 
-impl<'a, 'e> Unifier<State<'a>, ArcType> for Merge<'e> {
-    fn report_error(
-        unifier: &mut UnifierState<Self>,
-        error: UnifyError<ArcType, TypeError<Symbol>>,
-    ) {
-        unifier.unifier.errors.push(error);
+impl<'a, 'e> Unifier<State<'a>, ArcType> for UnifierState<'a, Subsume<'e>> {
+    fn report_error(&mut self, error: UnifyError<ArcType, TypeError<Symbol>>) {
+        debug!("Error {}", error);
+        self.unifier.errors.push(error);
     }
 
     fn try_match_res(
-        unifier: &mut UnifierState<Self>,
+        &mut self,
         l: &ArcType,
         r: &ArcType,
     ) -> Result<Option<ArcType>, UnifyError<ArcType, TypeError<Symbol>>> {
-        let subs = unifier.unifier.subs;
+        let subs = self.unifier.subs;
         // Retrieve the 'real' types by resolving
         let l = subs.real(l);
         let r = subs.real(r);
         // `l` and `r` must have the same type, if one is a variable that variable is
         // unified with whatever the other type is
         match (&**l, &**r) {
-            (&Type::Hole, _) => Ok(None),
+            (&Type::Hole, _) => Ok(Some(r.clone())),
             (&Type::Variable(ref l), &Type::Variable(ref r)) if l.id == r.id => Ok(None),
+            (&Type::Skolem(ref skolem), &Type::Variable(ref r_var))
+                if subs.get_level(skolem.id) > r_var.id =>
+            {
+                return Err(UnifyError::Other(TypeError::UnableToGeneralize(
+                    skolem.name.clone(),
+                )));
+            }
             (&Type::Generic(ref l_gen), &Type::Variable(ref r_var)) => {
-                let left = match unifier.unifier.variables.get(&l_gen.id) {
+                let left = match self.unifier.variables.get(&l_gen.id) {
                     Some(generic_bound_var) => {
                         match **generic_bound_var {
                             // The generic variable is defined outside the current scope. Use the
                             // type variable instantiated from the generic and unify with that
-                            Type::Variable(ref var) if var.id < unifier.unifier.level => {
+                            Type::Variable(ref var) if var.id < self.unifier.level => {
                                 generic_bound_var
                             }
                             // `r_var` is outside the scope of the generic variable.
                             Type::Variable(ref var) if var.id > r_var.id => {
-                                return Err(UnifyError::Other(
-                                    TypeError::UnableToGeneralize(l_gen.id.clone()),
-                                ));
+                                return Err(UnifyError::Other(TypeError::UnableToGeneralize(
+                                    l_gen.id.clone(),
+                                )));
+                            }
+                            Type::Skolem(ref skolem) if subs.get_level(skolem.id) > r_var.id => {
+                                return Err(UnifyError::Other(TypeError::UnableToGeneralize(
+                                    l_gen.id.clone(),
+                                )));
                             }
                             _ => l,
                         }
                     }
                     None => l,
                 };
-                subs.union(|| unifier.state.fresh(), r_var, left)?;
+                debug!("Union merge {} <> {}", left, r_var);
+                subs.union(r_var, left)?;
                 Ok(None)
             }
+
+            (_, &Type::Forall(_, _, Some(_))) => {
+                let r = r.instantiate_generics(&mut FnvMap::default());
+                Ok(self.try_match_res(l, &r)?)
+            }
+
+            // If we merge a forall with just a variable there is a chance that the variable
+            // may be unified again later on. If that happens we should treat it as if it was
+            // bound to the `forall` with a "skolem scope".
+            //
+            // ```gluon
+            // let make_Category cat : Category cat -> _ =
+            //     let { id, compose } = cat
+            //
+            //     let (<<): forall a b c . cat b c -> cat a b -> cat a c = compose
+            //     // If we didn't add a new skolem scope before inserting the union the user of
+            //     // `compose` here would unify `Forall(params, .., None)` with the `forall` from
+            //     // the `Category` in the first signature which can't unify. By calling
+            //     // `new_skolem_scope` however `compose` will look as if it was loaded via
+            //     // `Typecheck::find`
+            //     { id, compose, (<<) }
+            // ```
+            (&Type::Forall(ref params, ref l, _), _) => {
+                let mut variables = params
+                    .iter()
+                    .map(|param| (param.id.clone(), subs.new_var()))
+                    .collect();
+                let l = l.instantiate_generics(&mut variables);
+                self.try_match_res(&l, r)
+            }
             (_, &Type::Variable(ref r)) => {
-                subs.union(|| unifier.state.fresh(), r, l)?;
+                debug!("Union merge {} <> {}", l, r);
+                subs.union(r, l)?;
                 Ok(None)
             }
             (&Type::Variable(ref l), _) => {
-                subs.union(|| unifier.state.fresh(), l, r)?;
+                debug!("Union merge {} <> {}", l, r);
+                subs.union(l, r)?;
                 Ok(Some(r.clone()))
             }
             _ => {
                 // Both sides are concrete types, the only way they can be equal is if
                 // the matcher finds their top level to be equal (and their sub-terms
                 // unify)
-                l.zip_match(r, unifier)
+                l.zip_match(r, self)
             }
         }
     }
 
-    fn error_type(unifier: &mut UnifierState<Self>) -> Option<ArcType> {
-        Some(unifier.unifier.subs.new_var())
+    fn error_type(&mut self) -> Option<ArcType> {
+        Some(self.unifier.subs.new_var())
     }
+}
+
+fn reconstruct_forall(
+    subs: &Substitution<ArcType>,
+    params: &[Generic<Symbol>],
+    inner_type: ArcType,
+    vars: &[ArcType],
+) -> ArcType {
+    use substitution::is_variable_unified;
+
+    let mut new_params = Vec::new();
+    let mut new_vars = Vec::new();
+    for (param, var) in params
+        .iter()
+        .zip(vars)
+        .filter(|&(_, var)| !is_variable_unified(subs, var))
+    {
+        new_params.push(param.clone());
+        new_vars.push(var.clone());
+    }
+    Type::forall_with_vars(new_params, inner_type, Some(new_vars))
 }
 
 #[cfg(test)]
@@ -861,7 +1185,7 @@ mod tests {
 
     #[test]
     fn detect_multiple_type_errors_in_single_type() {
-        let _ = ::env_logger::init();
+        let _ = ::env_logger::try_init();
         let (x, y) = (intern("x"), intern("y"));
         let l: ArcType = Type::record(
             vec![],
@@ -892,7 +1216,7 @@ mod tests {
 
     #[test]
     fn unify_row_polymorphism() {
-        let _ = ::env_logger::init();
+        let _ = ::env_logger::try_init();
 
         let env = MockEnv;
         let subs = Substitution::new(Kind::typ());
@@ -912,7 +1236,7 @@ mod tests {
                 let expected = Type::poly_record(vec![], vec![x.clone(), y.clone()], row_variable);
                 assert_eq!(result, expected);
             }
-            Err(err) => panic!("{}", err),
+            Err(err) => ice!("{}", err),
         }
     }
 }

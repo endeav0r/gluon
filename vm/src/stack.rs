@@ -5,9 +5,41 @@ use base::symbol::Symbol;
 use base::pos::Line;
 
 use Variants;
-use gc::GcPtr;
-use value::{ClosureData, DataStruct, ExternFunction, Value};
+use gc::{Gc, GcPtr, Traverseable};
+use value::{ClosureData, DataStruct, ExternFunction, Value, ValueRepr};
 use types::VmIndex;
+
+pub trait StackPrimitive {
+    fn push_to(&self, stack: &mut Stack);
+}
+
+impl<'a, T: StackPrimitive + 'a> StackPrimitive for &'a T {
+    #[inline(always)]
+    fn push_to(&self, stack: &mut Stack) {
+        (**self).push_to(stack)
+    }
+}
+
+impl<'a> StackPrimitive for Variants<'a> {
+    #[inline(always)]
+    fn push_to(&self, stack: &mut Stack) {
+        self.0.push_to(stack)
+    }
+}
+
+impl StackPrimitive for ValueRepr {
+    #[inline(always)]
+    fn push_to(&self, stack: &mut Stack) {
+        stack.values.push(Value::from(*self))
+    }
+}
+
+impl StackPrimitive for Value {
+    #[inline(always)]
+    fn push_to(&self, stack: &mut Stack) {
+        stack.values.push(Value::from(self.get_repr()))
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde_derive", derive(DeserializeState, SerializeState))]
@@ -21,12 +53,9 @@ pub enum State {
     Excess,
     Closure(
         #[cfg_attr(feature = "serde_derive", serde(state_with = "::serialization::closure"))]
-        
-            GcPtr<ClosureData>,
+        GcPtr<ClosureData>,
     ),
-    Extern(
-        #[cfg_attr(feature = "serde_derive", serde(state))] GcPtr<ExternFunction>,
-    ),
+    Extern(#[cfg_attr(feature = "serde_derive", serde(state))] GcPtr<ExternFunction>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -36,7 +65,8 @@ pub enum State {
 pub struct Frame {
     pub offset: VmIndex,
     pub instruction_index: usize,
-    #[cfg_attr(feature = "serde_derive", serde(state))] pub state: State,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    pub state: State,
     pub excess: bool,
 }
 
@@ -57,8 +87,16 @@ pub struct Lock(VmIndex);
 #[cfg_attr(feature = "serde_derive", serde(deserialize_state = "::serialization::DeSeed"))]
 #[cfg_attr(feature = "serde_derive", serde(serialize_state = "::serialization::SeSeed"))]
 pub struct Stack {
-    #[cfg_attr(feature = "serde_derive", serde(state))] values: Vec<Value>,
-    #[cfg_attr(feature = "serde_derive", serde(state))] frames: Vec<Frame>,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    values: Vec<Value>,
+    #[cfg_attr(feature = "serde_derive", serde(state))]
+    frames: Vec<Frame>,
+}
+
+impl Traverseable for Stack {
+    fn traverse(&self, gc: &mut Gc) {
+        self.values.traverse(gc);
+    }
 }
 
 impl Stack {
@@ -79,8 +117,17 @@ impl Stack {
         self.values.pop().expect("pop on empty stack")
     }
 
-    pub fn push(&mut self, v: Value) {
-        self.values.push(v)
+    pub fn pop_many(&mut self, count: usize) {
+        for _ in 0..count {
+            self.values.pop();
+        }
+    }
+
+    pub fn push<T>(&mut self, v: T)
+    where
+        T: StackPrimitive,
+    {
+        v.push_to(self)
     }
 
     pub fn remove_range(&mut self, from: VmIndex, to: VmIndex) {
@@ -89,10 +136,10 @@ impl Stack {
         let len = to - from;
         let mid = from + ::std::cmp::min(self.values.len() - to, len);
         for i in from..mid {
-            self.values[i] = self.values[i + len];
+            self.values[i] = self.values[i + len].clone();
         }
         for i in mid..(self.values.len() - len) {
-            self.values[i] = self.values[i + len];
+            self.values[i] = self.values[i + len].clone();
         }
         unsafe {
             let current_len = self.values.len();
@@ -112,6 +159,10 @@ impl Stack {
         &self.frames
     }
 
+    pub fn get_frames_mut(&mut self) -> &mut [Frame] {
+        &mut self.frames
+    }
+
     pub fn current_frame(&mut self) -> StackFrame {
         StackFrame {
             frame: self.get_frames().last().expect("Frame").clone(),
@@ -123,7 +174,11 @@ impl Stack {
     ///
     /// Panics if the lock is not the top-most lock
     pub fn release_lock(&mut self, lock: Lock) {
-        assert!(self.frames.pop().map(|frame| frame.offset) == Some(lock.0));
+        let i = self.frames
+            .iter()
+            .rposition(|frame| frame.state == State::Lock)
+            .unwrap();
+        assert!(self.frames.remove(i).offset == lock.0);
     }
 
     /// Creates a stackrace starting from `frame_level`
@@ -137,11 +192,9 @@ impl Stack {
                         .debug_info
                         .source_map
                         .line(frame.instruction_index);
-                    Some(line.map(|line| {
-                        StacktraceFrame {
-                            name: closure.function.name.clone(),
-                            line: line,
-                        }
+                    Some(line.map(|line| StacktraceFrame {
+                        name: closure.function.name.clone(),
+                        line: line,
                     }))
                 }
                 State::Extern(ref ext) => Some(Some(StacktraceFrame {
@@ -214,19 +267,26 @@ impl<'a: 'b, 'b> StackFrame<'b> {
         self.stack.len() - self.frame.offset
     }
 
-    pub fn push(&mut self, v: Value) {
-        self.stack.values.push(v);
+    pub fn push<T>(&mut self, v: T)
+    where
+        T: StackPrimitive,
+    {
+        v.push_to(&mut self.stack)
     }
 
-    pub fn top(&mut self) -> Value {
-        *self.stack.values.last().expect("StackFrame: top")
+    pub fn top(&self) -> &Value {
+        self.stack.values.last().expect("StackFrame: top")
     }
 
     pub fn pop(&mut self) -> Value {
         self.stack.pop()
     }
 
-    pub fn get_variants(&self, index: VmIndex) -> Option<Variants> {
+    pub fn pop_many(&mut self, count: usize) {
+        self.stack.pop_many(count);
+    }
+
+    pub fn get_variant(&self, index: VmIndex) -> Option<Variants> {
         unsafe {
             if index < self.len() {
                 Some(Variants::new(&self[index]))
@@ -241,10 +301,10 @@ impl<'a: 'b, 'b> StackFrame<'b> {
         unsafe {
             let old_len = self.len();
             for i in (index..old_len).rev() {
-                *self.get_unchecked_mut(i as usize + values.len()) = self[i];
+                *self.get_unchecked_mut(i as usize + values.len()) = self[i].clone();
             }
             for (i, val) in (index..).zip(values) {
-                *self.get_unchecked_mut(i as usize) = *val;
+                *self.get_unchecked_mut(i as usize) = val.clone();
             }
             let new_len = self.stack.values.len() + values.len();
             self.stack.values.set_len(new_len);
@@ -256,18 +316,14 @@ impl<'a: 'b, 'b> StackFrame<'b> {
             .remove_range(self.frame.offset + from, self.frame.offset + to);
     }
 
-    pub fn get_rooted_value(&self, index: VmIndex) -> Value {
-        self[index]
-    }
-
-    pub fn get_upvar(&self, index: VmIndex) -> Value {
-        self.frame.upvars()[index as usize]
+    pub fn get_upvar(&self, index: VmIndex) -> &Value {
+        &self.frame.upvars()[index as usize]
     }
 
     pub fn excess_args(&self) -> Option<GcPtr<DataStruct>> {
         let i = self.stack.values.len() - self.len() as usize - 2;
-        match self.stack.values[i] {
-            Value::Data(data) => Some(data),
+        match self.stack.values[i].get_repr() {
+            ValueRepr::Data(data) => Some(data),
             _ => None,
         }
     }
@@ -316,6 +372,10 @@ impl<'a: 'b, 'b> StackFrame<'b> {
 
     /// Lock the stack below the current offset
     pub fn into_lock(mut self) -> Lock {
+        self.insert_lock()
+    }
+
+    pub fn insert_lock(&mut self) -> Lock {
         let offset = self.stack.len();
         self.frame = StackFrame::add_new_frame(&mut self.stack, 0, State::Lock);
         Lock(offset)
@@ -451,15 +511,14 @@ impl fmt::Display for Stacktrace {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use value::Value::*;
+    use value::ValueRepr::*;
 
     #[test]
     fn remove_range() {
-        let _ = ::env_logger::init();
+        let _ = ::env_logger::try_init();
 
         let mut stack = Stack::new();
         let mut frame = StackFrame::frame(&mut stack, 0, State::Unknown);
@@ -477,17 +536,20 @@ mod tests {
 
         frame.exit_scope().unwrap();
         frame.remove_range(2, 5);
-        assert_eq!(frame.stack.values, vec![Int(0), Int(1), Int(5), Int(6)]);
+        assert_eq!(
+            frame.stack.values,
+            vec![Int(0).into(), Int(1).into(), Int(5).into(), Int(6).into()]
+        );
 
         frame.exit_scope().unwrap();
         frame.remove_range(1, 3);
-        assert_eq!(frame.stack.values, vec![Int(0), Int(6)]);
+        assert_eq!(frame.stack.values, vec![Int(0).into(), Int(6).into()]);
     }
 
     #[test]
     #[should_panic]
     fn attempt_take_locked_range() {
-        let _ = ::env_logger::init();
+        let _ = ::env_logger::try_init();
 
         let mut stack = Stack::new();
         {
@@ -504,7 +566,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn attempt_pop_locked() {
-        let _ = ::env_logger::init();
+        let _ = ::env_logger::try_init();
 
         let mut stack = Stack::new();
         {
@@ -519,7 +581,7 @@ mod tests {
 
     #[test]
     fn lock_unlock() {
-        let _ = ::env_logger::init();
+        let _ = ::env_logger::try_init();
 
         let mut stack = Stack::new();
         let lock = {
@@ -537,6 +599,35 @@ mod tests {
         }
         stack.release_lock(lock);
         let mut frame = StackFrame::current(&mut stack);
-        assert_eq!(frame.pop(), Int(2));
+        assert_eq!(frame.pop(), Value::from(Int(2)));
+    }
+
+    #[test]
+    fn insert_stack_slice() {
+        let _ = ::env_logger::try_init();
+
+        let mut stack = Stack::new();
+        StackFrame::frame(&mut stack, 0, State::Unknown);
+        let mut stack = StackFrame::current(&mut stack);
+        stack.push(Int(0));
+        stack.insert_slice(0, &[Int(2).into(), Int(1).into()]);
+        assert_eq!(&stack[..], [Int(2).into(), Int(1).into(), Int(0).into()]);
+        stack.enter_scope(2, State::Unknown);
+        stack.insert_slice(1, &[Int(10).into()]);
+        assert_eq!(&stack[..], [Int(1).into(), Int(10).into(), Int(0).into()]);
+        stack.insert_slice(1, &[]);
+        assert_eq!(&stack[..], [Int(1).into(), Int(10).into(), Int(0).into()]);
+        stack.insert_slice(2, &[Int(4).into(), Int(5).into(), Int(6).into()]);
+        assert_eq!(
+            &stack[..],
+            [
+                Int(1).into(),
+                Int(10).into(),
+                Int(4).into(),
+                Int(5).into(),
+                Int(6).into(),
+                Int(0).into()
+            ]
+        );
     }
 }

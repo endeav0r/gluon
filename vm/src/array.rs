@@ -1,56 +1,57 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::slice;
 
 use gc::{Gc, Traverseable};
 
-enum Void {}
+mod internal {
+    pub struct CantConstruct(());
+}
 
 /// Abstract array type which have their length store inline with the elements.
 /// Fills the same role as Box<[T]> but takes only 8 bytes on the stack instead of 16
-pub struct Array<T: Copy> {
+#[repr(C)]
+pub struct Array<T> {
     len: usize,
     array_start: [T; 0],
-    /// Prevents the array from being instantiated directly
-    _void: Void,
+    _marker: self::internal::CantConstruct,
 }
 
-impl<T: Copy> AsRef<[T]> for Array<T> {
+impl<T> AsRef<[T]> for Array<T> {
     fn as_ref(&self) -> &[T] {
         self
     }
 }
 
-impl<T: Copy> AsMut<[T]> for Array<T> {
+impl<T> AsMut<[T]> for Array<T> {
     fn as_mut(&mut self) -> &mut [T] {
         self
     }
 }
 
-impl<T: Copy + PartialEq> PartialEq for Array<T> {
+impl<T: PartialEq> PartialEq for Array<T> {
     fn eq(&self, other: &Array<T>) -> bool {
         &**self == other.as_ref()
     }
 }
 
-impl<T: Copy + Eq> Eq for Array<T> {}
+impl<T: Eq> Eq for Array<T> {}
 
-impl<T: Copy + PartialOrd> PartialOrd for Array<T> {
+impl<T: PartialOrd> PartialOrd for Array<T> {
     fn partial_cmp(&self, other: &Array<T>) -> Option<Ordering> {
         (&**self).partial_cmp(other.as_ref())
     }
 }
 
-impl<T: Copy + Ord> Ord for Array<T> {
+impl<T: Ord> Ord for Array<T> {
     fn cmp(&self, other: &Array<T>) -> Ordering {
         (&**self).cmp(other)
     }
 }
 
-impl<T: Copy + Hash> Hash for Array<T> {
+impl<T: Hash> Hash for Array<T> {
     fn hash<H>(&self, hasher: &mut H)
     where
         H: Hasher,
@@ -59,23 +60,19 @@ impl<T: Copy + Hash> Hash for Array<T> {
     }
 }
 
-impl<T: Copy + fmt::Debug> fmt::Debug for Array<T> {
+impl<T: fmt::Debug> fmt::Debug for Array<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", &**self)
     }
 }
 
-impl<T: Copy + Traverseable> Traverseable for Array<T> {
+impl<T: Traverseable> Traverseable for Array<T> {
     fn traverse(&self, gc: &mut Gc) {
         (**self).traverse(gc)
     }
 }
 
-impl<T: Copy> Array<T> {
-    pub fn size_of(len: usize) -> usize {
-        mem::size_of::<usize>() + mem::size_of::<T>() * len
-    }
-
+impl<T> Array<T> {
     pub unsafe fn set_len(&mut self, len: usize) {
         self.len = len;
     }
@@ -97,20 +94,20 @@ impl<T: Copy> Array<T> {
     }
 }
 
-impl<T: Copy> Deref for Array<T> {
+impl<T> Deref for Array<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         unsafe { slice::from_raw_parts(self.array_start.as_ptr(), self.len) }
     }
 }
 
-impl<T: Copy> DerefMut for Array<T> {
+impl<T> DerefMut for Array<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         unsafe { slice::from_raw_parts_mut(self.array_start.as_mut_ptr(), self.len) }
     }
 }
 
-impl<'a, T: Copy + 'a> IntoIterator for &'a Array<T> {
+impl<'a, T: 'a> IntoIterator for &'a Array<T> {
     type Item = &'a T;
     type IntoIter = <&'a [T] as IntoIterator>::IntoIter;
     fn into_iter(self) -> Self::IntoIter {
@@ -118,10 +115,30 @@ impl<'a, T: Copy + 'a> IntoIterator for &'a Array<T> {
     }
 }
 
-impl<'a, T: Copy + 'a> IntoIterator for &'a mut Array<T> {
+impl<'a, T: 'a> IntoIterator for &'a mut Array<T> {
     type Item = &'a mut T;
     type IntoIter = <&'a mut [T] as IntoIterator>::IntoIter;
     fn into_iter(self) -> Self::IntoIter {
         (&mut **self).into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_values_offset() {
+        use std::mem;
+        use std::ptr;
+
+        unsafe {
+            let p: *const Array<i32> = ptr::null();
+            assert_eq!(p as *const u8, &(*p).len as *const _ as *const u8);
+            assert_eq!(
+                (p as *const u8).offset(mem::size_of::<usize>() as isize),
+                &(*p).array_start as *const _ as *const u8
+            );
+        }
     }
 }

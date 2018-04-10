@@ -1,7 +1,7 @@
 use base::fnv::FnvMap;
 use base::kind::{ArcKind, Kind, KindEnv};
 use base::symbol::{Symbol, SymbolRef};
-use base::types::{Alias, ArcType, RecordSelector, Type, TypeEnv};
+use base::types::{Alias, ArcType, Type, TypeEnv};
 
 pub use self::Instruction::*;
 
@@ -29,8 +29,6 @@ pub enum Instruction {
     PushUpVar(VmIndex),
     /// Push the value at `index`
     Push(VmIndex),
-    /// Push the value at `index`
-    PushGlobal(VmIndex),
     /// Call a function by passing it `args` number of arguments. The function is at the index in
     /// the stack just before the arguments. After the call is all arguments are removed and the
     /// function is replaced by the result of the call.
@@ -118,12 +116,11 @@ pub enum Instruction {
     FloatEQ,
 }
 
-
 impl Instruction {
     /// Returns by how much the stack is adjusted when executing the instruction `self`.
     pub fn adjust(&self) -> i32 {
         match *self {
-            PushInt(_) | PushByte(_) | PushFloat(_) | PushString(_) | Push(_) | PushGlobal(_) => 1,
+            PushInt(_) | PushByte(_) | PushFloat(_) | PushString(_) | Push(_) => 1,
             Call(n) => -(n as i32),
             TailCall(n) => -(n as i32),
             Construct { args, .. } | ConstructRecord { args, .. } | ConstructArray(args) => {
@@ -142,24 +139,9 @@ impl Instruction {
             NewClosure { .. } => 1,
             CloseClosure(_) => -1,
             PushUpVar(_) => 1,
-            AddInt |
-            SubtractInt |
-            MultiplyInt |
-            DivideInt |
-            IntLT |
-            IntEQ |
-            AddFloat |
-            AddByte |
-            SubtractByte |
-            MultiplyByte |
-            DivideByte |
-            ByteLT |
-            ByteEQ |
-            SubtractFloat |
-            MultiplyFloat |
-            DivideFloat |
-            FloatLT |
-            FloatEQ => -1,
+            AddInt | SubtractInt | MultiplyInt | DivideInt | IntLT | IntEQ | AddFloat | AddByte
+            | SubtractByte | MultiplyByte | DivideByte | ByteLT | ByteEQ | SubtractFloat
+            | MultiplyFloat | DivideFloat | FloatLT | FloatEQ => -1,
         }
     }
 }
@@ -175,19 +157,18 @@ pub struct TypeInfos {
 
 impl KindEnv for TypeInfos {
     fn find_kind(&self, type_name: &SymbolRef) -> Option<ArcKind> {
-        let type_name = AsRef::<str>::as_ref(type_name);
+        let type_name = type_name.definition_name();
         self.id_to_type.get(type_name).map(|alias| {
-            alias.args.iter().rev().fold(
-                Kind::typ(),
-                |acc, arg| Kind::function(arg.kind.clone(), acc),
-            )
+            alias.params().iter().rev().fold(Kind::typ(), |acc, arg| {
+                Kind::function(arg.kind.clone(), acc)
+            })
         })
     }
 }
 
 impl TypeEnv for TypeInfos {
     fn find_type(&self, id: &SymbolRef) -> Option<&ArcType> {
-        let id = AsRef::<str>::as_ref(id);
+        let id = id.definition_name();
         self.id_to_type
             .iter()
             .filter_map(|(_, ref alias)| match **alias.unresolved_type() {
@@ -199,16 +180,7 @@ impl TypeEnv for TypeInfos {
     }
 
     fn find_type_info(&self, id: &SymbolRef) -> Option<&Alias<Symbol, ArcType>> {
-        let id = AsRef::<str>::as_ref(id);
-        self.id_to_type.get(id)
-    }
-
-    fn find_record(
-        &self,
-        _fields: &[Symbol],
-        _selector: RecordSelector,
-    ) -> Option<(ArcType, ArcType)> {
-        None
+        self.id_to_type.get(id.definition_name())
     }
 }
 

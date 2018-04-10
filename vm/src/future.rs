@@ -26,13 +26,19 @@ where
     pub fn sync_or_error(self) -> Result<F::Item, F::Error> {
         match self {
             FutureValue::Value(v) => v,
-            FutureValue::Future(_) => Err(
-                Error::Message("Future needs to be resolved asynchronously".into()).into(),
-            ),
+            FutureValue::Future(_) => {
+                Err(Error::Message("Future needs to be resolved asynchronously".into()).into())
+            }
             FutureValue::Polled => {
-                panic!("`FutureValue` may not be polled again if it contained a value")
+                ice!("`FutureValue` may not be polled again if it contained a value")
             }
         }
+    }
+}
+
+impl<T, E> From<Result<T, E>> for FutureValue<FutureResult<T, E>> {
+    fn from(result: Result<T, E>) -> FutureValue<FutureResult<T, E>> {
+        FutureValue::Value(result)
     }
 }
 
@@ -101,7 +107,7 @@ where
     pub fn then<G, B>(self, g: G) -> FutureValue<Either<B, Then<F, FutureValue<B>, G>>>
     where
         G: FnOnce(Result<F::Item, F::Error>) -> FutureValue<B>,
-        B: Future<Error = F::Error>,
+        B: Future,
     {
         match self {
             FutureValue::Value(v) => match g(v) {
@@ -149,7 +155,7 @@ where
             },
             FutureValue::Future(ref mut f) => f.poll(),
             FutureValue::Polled => {
-                panic!("`FutureValue` may not be polled again if it contained a value")
+                ice!("`FutureValue` may not be polled again if it contained a value")
             }
         }
     }
@@ -159,7 +165,7 @@ where
             FutureValue::Value(v) => v,
             FutureValue::Future(f) => f.wait(),
             FutureValue::Polled => {
-                panic!("`FutureValue` may not be polled again if it contained a value")
+                ice!("`FutureValue` may not be polled again if it contained a value")
             }
         }
     }

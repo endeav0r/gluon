@@ -1,8 +1,10 @@
 use std::marker::PhantomData;
 
 use base::ast::TypedIdent;
+use base::types::{ArcType, Field};
 use base::merge::{merge_fn, merge_iter};
 use base::pos;
+use base::symbol::Symbol;
 
 use core::{Allocator, Alternative, CExpr, Closure, Expr, LetBinding, Named, Pattern};
 
@@ -66,7 +68,6 @@ impl<'a, 'b> Visitor<'a, 'b> for DifferentLifetime<'a, 'b> {
     }
 }
 
-
 pub trait Visitor<'a, 'b> {
     type Producer: ExprProducer<'a, 'b>;
 
@@ -88,6 +89,37 @@ impl<'a> Visitor<'a, 'a> for RecognizeUnnecessaryAllocation<'a> {
     type Producer = SameLifetime<'a>;
 
     fn visit_expr(&mut self, expr: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+        fn make_let<'b>(
+            self_: &mut RecognizeUnnecessaryAllocation<'b>,
+            fields: &[(TypedIdent<Symbol>, Option<Symbol>)],
+            next_expr: &'b Expr<'b>,
+            field: &Field<Symbol, ArcType>,
+            expr: &'b Expr<'b>,
+        ) -> &'b Expr<'b> {
+            let pattern_field = fields
+                .iter()
+                .find(|f| f.0.name.name_eq(&field.name))
+                .map(|pattern_field| {
+                    pattern_field
+                        .1
+                        .as_ref()
+                        .unwrap_or(&pattern_field.0.name)
+                        .clone()
+                })
+                .unwrap_or_else(|| Symbol::from("dummy"));
+            let new_expr = Expr::Let(
+                LetBinding {
+                    name: TypedIdent {
+                        name: pattern_field.clone(),
+                        typ: field.typ.clone(),
+                    },
+                    expr: Named::Expr(expr),
+                    span_start: pos::BytePos::default(),
+                },
+                next_expr,
+            );
+            &*self_.allocator().arena.alloc(new_expr)
+        }
         // Avoids boxing data which are destructured immediately after creation
         // match { l, r } with
         // | { l, r } -> ...
@@ -111,24 +143,7 @@ impl<'a> Visitor<'a, 'a> for RecognizeUnnecessaryAllocation<'a> {
                                 .into_iter()
                                 .rev()
                                 .fold(next_expr, |next_expr, (field, expr)| {
-                                    let pattern_field = fields
-                                        .iter()
-                                        .find(|f| f.0.name.name_eq(&field.name))
-                                        .unwrap();
-                                    let pattern_field =
-                                        pattern_field.1.as_ref().unwrap_or(&pattern_field.0.name);
-                                    let new_expr = Expr::Let(
-                                        LetBinding {
-                                            name: TypedIdent {
-                                                name: pattern_field.clone(),
-                                                typ: field.typ.clone(),
-                                            },
-                                            expr: Named::Expr(expr),
-                                            span_start: pos::BytePos::default(),
-                                        },
-                                        next_expr,
-                                    );
-                                    &*self.allocator().arena.alloc(new_expr)
+                                    make_let(self, fields, next_expr, field, expr)
                                 }),
                         )
                     }
@@ -166,17 +181,16 @@ where
     match *expr {
         Expr::Call(f, args) => {
             let new_f = visitor.visit_expr(f);
-            let new_args = merge_iter(
-                args,
-                |expr| visitor.visit_expr_(expr),
-                |e| {
-                    V::Producer::new(allocator.expect("Allocator"))
-                        .produce(e)
-                        .clone()
-                },
-            ).map(|exprs: Vec<_>| {
-                &*visitor.allocator().arena.alloc_extend(exprs.into_iter())
-            });
+            let new_args =
+                merge_iter(
+                    args,
+                    |expr| visitor.visit_expr_(expr),
+                    |e| {
+                        V::Producer::new(allocator.expect("Allocator"))
+                            .produce(e)
+                            .clone()
+                    },
+                ).map(|exprs: Vec<_>| &*visitor.allocator().arena.alloc_extend(exprs.into_iter()));
 
             merge_fn(
                 &f,
@@ -246,11 +260,9 @@ where
                 &alts,
                 |a| {
                     let a = a.iter()
-                        .map(|a| {
-                            Alternative {
-                                pattern: a.pattern.clone(),
-                                expr: V::Producer::new(visitor.allocator()).produce(a.expr),
-                            }
+                        .map(|a| Alternative {
+                            pattern: a.pattern.clone(),
+                            expr: V::Producer::new(visitor.allocator()).produce(a.expr),
                         })
                         .collect::<Vec<_>>();
                     visitor.allocator().alternative_arena.alloc_extend(a)
@@ -262,7 +274,6 @@ where
     }
 }
 
-
 fn walk_bind<'a, 'b, V>(visitor: &mut V, bind: &LetBinding<'b>) -> Option<LetBinding<'a>>
 where
     V: ?Sized + Visitor<'a, 'b>,
@@ -272,32 +283,26 @@ where
         Named::Recursive(ref closures) => merge_iter(
             closures,
             |closure| {
-                visitor.visit_expr(closure.expr).map(|new_expr| {
-                    Closure {
-                        pos: closure.pos,
-                        name: closure.name.clone(),
-                        args: closure.args.clone(),
-                        expr: new_expr,
-                    }
-                })
-            },
-            |closure| {
-                Closure {
+                visitor.visit_expr(closure.expr).map(|new_expr| Closure {
                     pos: closure.pos,
                     name: closure.name.clone(),
                     args: closure.args.clone(),
-                    expr: V::Producer::new(allocator.expect("Allocator")).produce(closure.expr),
-                }
+                    expr: new_expr,
+                })
+            },
+            |closure| Closure {
+                pos: closure.pos,
+                name: closure.name.clone(),
+                args: closure.args.clone(),
+                expr: V::Producer::new(allocator.expect("Allocator")).produce(closure.expr),
             },
         ).map(Named::Recursive),
         Named::Expr(bind_expr) => visitor.visit_expr(bind_expr).map(Named::Expr),
     };
-    new_named.map(|named| {
-        LetBinding {
-            name: bind.name.clone(),
-            expr: named,
-            span_start: bind.span_start,
-        }
+    new_named.map(|named| LetBinding {
+        name: bind.name.clone(),
+        expr: named,
+        span_start: bind.span_start,
     })
 }
 
@@ -306,14 +311,11 @@ where
     V: ?Sized + Visitor<'a, 'b>,
 {
     let new_expr = visitor.visit_expr(alt.expr);
-    new_expr.map(|expr| {
-        Alternative {
-            pattern: alt.pattern.clone(),
-            expr: expr,
-        }
+    new_expr.map(|expr| Alternative {
+        pattern: alt.pattern.clone(),
+        expr: expr,
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -322,7 +324,7 @@ mod tests {
     use base::symbol::Symbols;
 
     use core;
-    use core::grammar::parse_Expr as parse_core_expr;
+    use core::grammar::ExprParser;
 
     #[test]
     fn unnecessary_allocation() {
@@ -334,9 +336,9 @@ mod tests {
             | { l, r } -> l
             end
             "#;
-        let initial_expr = allocator.arena.alloc(
-            parse_core_expr(&mut symbols, &allocator, initial_str).unwrap(),
-        );
+        let initial_expr = allocator
+            .arena
+            .alloc(ExprParser::new().parse(&mut symbols, &allocator, initial_str).unwrap());
 
         let optimized_expr = optimize(&allocator, initial_expr);
 
@@ -347,7 +349,7 @@ mod tests {
             in
             l
             "#;
-        let expected_expr = parse_core_expr(&mut symbols, &allocator, expected_str).unwrap();
+        let expected_expr = ExprParser::new().parse(&mut symbols, &allocator, expected_str).unwrap();
         assert_deq!(*optimized_expr, expected_expr);
     }
 }

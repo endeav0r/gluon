@@ -14,16 +14,17 @@ use base::serialization::{NodeMap, NodeToId};
 use base::symbol::{Symbol, Symbols};
 use base::types::ArcType;
 
+use Variants;
 use array::Array;
 use gc::{DataDef, GcPtr, WriteOnly};
 use thread::{RootedThread, Thread, ThreadInternal};
 use types::VmIndex;
 use value::{BytecodeFunction, Callable, ClosureData, ExternFunction, PartialApplicationData,
-            PartialApplicationDataDef, Value};
+            PartialApplicationDataDef, Value, ValueRepr};
 
 #[derive(Clone)]
 pub struct DeSeed {
-    thread: RootedThread,
+    pub thread: RootedThread,
     symbols: Rc<RefCell<Symbols>>,
     gc_map: NodeMap,
     base_seed: ::base::serialization::Seed<Symbol, ArcType<Symbol>>,
@@ -54,10 +55,8 @@ impl AsMut<NodeMap> for DeSeed {
     }
 }
 
-
 pub struct SeSeed {
     node_to_id: ::base::serialization::SeSeed,
-    thread: RootedThread,
 }
 
 impl AsRef<NodeToId> for SeSeed {
@@ -67,10 +66,9 @@ impl AsRef<NodeToId> for SeSeed {
 }
 
 impl SeSeed {
-    pub fn new(thread: &Thread) -> SeSeed {
+    pub fn new() -> SeSeed {
         SeSeed {
             node_to_id: Default::default(),
-            thread: thread.root_thread(),
         }
     }
 }
@@ -110,7 +108,7 @@ pub mod gc {
     use serde::ser::{Serialize, SerializeState, Serializer};
 
     use interner::InternedStr;
-    use value::{DataStruct, GcStr, Value, ValueArray};
+    use value::{DataStruct, GcStr, ValueArray};
     use thread::ThreadInternal;
     use types::VmTag;
 
@@ -184,13 +182,15 @@ pub mod gc {
                                  S: ::std::ops::Deref + ::std::any::Any + Clone
                                     + ::base::serialization::Shared
                                     + DeserializeState<'de, ::serialization::DeSeed>",
-                    serialize = "F: SerializeState<::serialization::SeSeed>,
+                  serialize = "F: SerializeState<::serialization::SeSeed>,
                                S: ::std::ops::Deref + ::std::any::Any + Clone
                                     + ::base::serialization::Shared,
                                S::Target: SerializeState<::serialization::SeSeed>"))]
     struct Data<F, S> {
-        #[serde(state)] tag: DataTag<S>,
-        #[serde(state)] fields: F,
+        #[serde(state)]
+        tag: DataTag<S>,
+        #[serde(state)]
+        fields: F,
     }
 
     #[derive(DeserializeState, SerializeState)]
@@ -199,7 +199,7 @@ pub mod gc {
     #[serde(bound(deserialize = "S: ::std::ops::Deref + ::std::any::Any + Clone
                                     + ::base::serialization::Shared
                                     + DeserializeState<'de, ::serialization::DeSeed>",
-                    serialize = "S: ::std::ops::Deref + ::std::any::Any + Clone
+                  serialize = "S: ::std::ops::Deref + ::std::any::Any + Clone
                                     + ::base::serialization::Shared,
                                S::Target: SerializeState<::serialization::SeSeed>"))]
     enum DataTag<S> {
@@ -207,19 +207,13 @@ pub mod gc {
         Data(VmTag),
     }
 
-
     impl SerializeState<SeSeed> for DataStruct {
         fn serialize_state<S>(&self, serializer: S, seed: &SeSeed) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
-            use serde::ser::Error;
             let tag = if self.is_record() {
-                let fields = seed.thread
-                    .context()
-                    .get_fields(self.tag())
-                    .ok_or_else(|| S::Error::custom("Undefined record"))?
-                    .clone();
+                let fields = unsafe { GcPtr::from_raw(self).field_names().clone() };
                 DataTag::Record(fields)
             } else {
                 DataTag::Data(self.tag())
@@ -262,19 +256,25 @@ pub mod gc {
                     seed,
                     deserializer,
                 )?;
-                use value::Def;
-                let tag = match def.tag {
-                    DataTag::Record(fields) => seed.thread.context().get_map(&fields),
-                    DataTag::Data(tag) => tag,
-                };
-                seed.thread
-                    .context()
-                    .gc
-                    .alloc(Def {
-                        tag: tag,
-                        elems: &def.fields,
-                    })
-                    .map_err(D::Error::custom)
+                use value::{Def, RecordDef};
+                match def.tag {
+                    DataTag::Record(fields) => seed.thread
+                        .context()
+                        .gc
+                        .alloc(RecordDef {
+                            elems: &def.fields,
+                            fields: &fields[..],
+                        })
+                        .map_err(D::Error::custom),
+                    DataTag::Data(tag) => seed.thread
+                        .context()
+                        .gc
+                        .alloc(Def {
+                            tag: tag,
+                            elems: &def.fields,
+                        })
+                        .map_err(D::Error::custom),
+                }
             }
         }
 
@@ -433,17 +433,18 @@ unsafe impl DataDef for ClosureDataModel {
 
     fn size(&self) -> usize {
         use std::mem::size_of;
-        use array::Array;
-        size_of::<GcPtr<BytecodeFunction>>() + Array::<Value>::size_of(self.upvars)
+        size_of::<ClosureData>() + size_of::<Value>() * self.upvars
     }
 
     fn initialize<'w>(self, mut result: WriteOnly<'w, Self::Value>) -> &'w mut Self::Value {
         unsafe {
             let result = &mut *result.as_mut_ptr();
             result.function = self.function;
-            result
-                .upvars
-                .initialize(::std::iter::repeat(Value::Int(0)).take(self.upvars));
+            result.upvars.initialize(
+                ::std::iter::repeat(())
+                    .map(|_| ValueRepr::Int(0).into())
+                    .take(self.upvars),
+            );
             result
         }
     }
@@ -519,9 +520,9 @@ pub mod closure {
                         unsafe {
                             match variant {
                                 GraphVariant::Marked(id) => {
-                                    let function = seq.next_element_seed(
-                                        ::serde::de::Seed::new(&mut self.state),
-                                    )?
+                                    let function = seq.next_element_seed(::serde::de::Seed::new(
+                                        &mut self.state,
+                                    ))?
                                         .ok_or_else(|| V::Error::invalid_length(1, &self))?;
                                     let upvars = seq.next_element()?
                                         .ok_or_else(|| V::Error::invalid_length(2, &self))?;
@@ -540,9 +541,9 @@ pub mod closure {
                                     self.state.gc_map.insert(id, closure);
 
                                     for i in 0..upvars {
-                                        let value = seq.next_element_seed(
-                                            ::serde::de::Seed::new(&mut self.state),
-                                        )?
+                                        let value = seq.next_element_seed(::serde::de::Seed::new(
+                                            &mut self.state,
+                                        ))?
                                             .ok_or_else(|| V::Error::invalid_length(i + 2, &self))?;
                                         closure.as_mut().upvars[i] = value;
                                     }
@@ -583,8 +584,10 @@ pub mod closure {
 #[derive(DeserializeState)]
 #[cfg_attr(feature = "serde_derive", serde(deserialize_state = "DeSeed"))]
 struct PartialApplicationModel {
-    #[cfg_attr(feature = "serde_derive", serde(deserialize_state))] function: Callable,
-    #[cfg_attr(feature = "serde_derive", serde(deserialize_state))] args: Vec<Value>,
+    #[cfg_attr(feature = "serde_derive", serde(deserialize_state))]
+    function: Callable,
+    #[cfg_attr(feature = "serde_derive", serde(deserialize_state))]
+    args: Vec<Value>,
 }
 
 unsafe impl DataDef for PartialApplicationModel {
@@ -611,7 +614,6 @@ where
         deserializer,
     )
 }
-
 
 struct DataDefSeed<T>(PhantomData<T>);
 
@@ -704,12 +706,14 @@ impl<'de> DeserializeState<'de, DeSeed> for ExternFunction {
             .get_global::<OpaqueValue<&Thread, Hole>>(&escaped_id)
             .map_err(|err| D::Error::custom(err))?;
         unsafe {
-            match function.get_value() {
-                Value::Function(function) if partial.args == function.args => Ok(ExternFunction {
-                    id: function.id.clone(),
-                    args: function.args,
-                    function: function.function,
-                }),
+            match function.get_value().get_repr() {
+                ValueRepr::Function(function) if partial.args == function.args => {
+                    Ok(ExternFunction {
+                        id: function.id.clone(),
+                        args: function.args,
+                        function: function.function,
+                    })
+                }
                 _ => Err(D::Error::custom("Invalid type for extern function")),
             }
         }
@@ -718,7 +722,7 @@ impl<'de> DeserializeState<'de, DeSeed> for ExternFunction {
 
 impl<T> SerializeState<SeSeed> for Array<T>
 where
-    T: Copy + SerializeState<SeSeed>,
+    T: SerializeState<SeSeed>,
 {
     fn serialize_state<S>(&self, serializer: S, seed: &SeSeed) -> Result<S::Ok, S::Error>
     where
@@ -736,6 +740,20 @@ where
     Err(S::Error::custom("Userdata cannot be serialized"))
 }
 
+impl<'a> ::serde::ser::SerializeState<::serialization::SeSeed> for Variants<'a> {
+    #[inline]
+    fn serialize_state<S>(
+        &self,
+        serializer: S,
+        seed: &::serialization::SeSeed,
+    ) -> ::std::result::Result<S::Ok, S::Error>
+    where
+        S: ::serde::ser::Serializer,
+    {
+        self.0.serialize_state(serializer, seed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate serde_json;
@@ -749,9 +767,9 @@ mod tests {
         let thread = RootedThread::new();
         let mut de = serde_json::Deserializer::from_str(r#" { "String": "test" } "#);
         let value: Value = DeSeed::new(&thread).deserialize(&mut de).unwrap();
-        match value {
-            Value::String(s) => assert_eq!(&*s, "test"),
-            _ => panic!(),
+        match value.get_repr() {
+            ValueRepr::String(s) => assert_eq!(&*s, "test"),
+            _ => ice!(),
         }
     }
 
@@ -773,12 +791,12 @@ mod tests {
         } "#,
         );
         let value: Value = DeSeed::new(&thread).deserialize(&mut de).unwrap();
-        match value {
-            Value::Array(s) => assert_eq!(
-                s.iter().collect::<Vec<_>>(),
-                [Value::Int(1), Value::Int(2), Value::Int(3)]
+        match value.get_repr() {
+            ValueRepr::Array(s) => assert_eq!(
+                s.iter().map(|v| v.get_value()).collect::<Vec<_>>(),
+                [Value::int(1), Value::int(2), Value::int(3)]
             ),
-            _ => panic!(),
+            _ => ice!(),
         }
     }
 }

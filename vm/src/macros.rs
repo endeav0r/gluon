@@ -1,10 +1,14 @@
 //! Module providing the building blocks to create macros and expand them.
 use std::any::Any;
+use std::mem;
 use std::sync::{Arc, RwLock};
 use std::error::Error as StdError;
 
+use futures::{stream, Future, Stream};
+
 use base::ast::{self, Expr, MutVisitor, SpannedExpr};
-use base::error::Errors;
+use base::pos::{BytePos, Spanned};
+use base::error::Errors as BaseErrors;
 use base::fnv::FnvMap;
 use base::pos;
 use base::symbol::Symbol;
@@ -12,30 +16,29 @@ use base::symbol::Symbol;
 use thread::Thread;
 
 pub type Error = Box<StdError + Send + Sync>;
+pub type SpannedError = Spanned<Error, BytePos>;
+pub type Errors = BaseErrors<SpannedError>;
+pub type MacroFuture = Box<Future<Item = SpannedExpr<Symbol>, Error = Error> + Send>;
 
 /// A trait which abstracts over macros.
 ///
 /// A macro is similiar to a function call but is run at compile time instead of at runtime.
 pub trait Macro: ::mopa::Any + Send + Sync {
-    fn expand(
-        &self,
-        env: &mut MacroExpander,
-        args: &mut [SpannedExpr<Symbol>],
-    ) -> Result<SpannedExpr<Symbol>, Error>;
+    fn expand(&self, env: &mut MacroExpander, args: Vec<SpannedExpr<Symbol>>) -> MacroFuture;
 }
 
 mopafy!(Macro);
 
 impl<F: ::mopa::Any + Clone + Send + Sync> Macro for F
 where
-    F: Fn(&mut MacroExpander, &mut [SpannedExpr<Symbol>])
-        -> Result<SpannedExpr<Symbol>, Error>,
+    F: Fn(&mut MacroExpander, Vec<SpannedExpr<Symbol>>)
+        -> Box<Future<Item = SpannedExpr<Symbol>, Error = Error> + Send>,
 {
     fn expand(
         &self,
         env: &mut MacroExpander,
-        args: &mut [SpannedExpr<Symbol>],
-    ) -> Result<SpannedExpr<Symbol>, Error> {
+        args: Vec<SpannedExpr<Symbol>>,
+    ) -> Box<Future<Item = SpannedExpr<Symbol>, Error = Error> + Send> {
         self(env, args)
     }
 }
@@ -69,9 +72,9 @@ impl MacroEnv {
     }
 
     /// Runs the macros in this `MacroEnv` on `expr` using `env` as the context of the expansion
-    pub fn run(&self, vm: &Thread, expr: &mut SpannedExpr<Symbol>) -> Result<(), Errors<Error>> {
+    pub fn run(&self, vm: &Thread, expr: &mut SpannedExpr<Symbol>) -> Result<(), Errors> {
         let mut expander = MacroExpander::new(vm);
-        expander.visit_expr(expr);
+        expander.run(expr);
         expander.finish()
     }
 }
@@ -79,7 +82,8 @@ impl MacroEnv {
 pub struct MacroExpander<'a> {
     pub state: FnvMap<String, Box<Any>>,
     pub vm: &'a Thread,
-    pub errors: Errors<Error>,
+    pub errors: Errors,
+    pub error_in_expr: bool,
     macros: &'a MacroEnv,
 }
 
@@ -89,12 +93,13 @@ impl<'a> MacroExpander<'a> {
             vm: vm,
             state: FnvMap::default(),
             macros: vm.get_macros(),
+            error_in_expr: false,
             errors: Errors::new(),
         }
     }
 
-    pub fn finish(self) -> Result<(), Errors<Error>> {
-        if self.errors.has_errors() {
+    pub fn finish(self) -> Result<(), Errors> {
+        if self.error_in_expr || self.errors.has_errors() {
             Err(self.errors)
         } else {
             Ok(())
@@ -102,27 +107,70 @@ impl<'a> MacroExpander<'a> {
     }
 
     pub fn run(&mut self, expr: &mut SpannedExpr<Symbol>) {
-        self.visit_expr(expr);
+        {
+            let exprs = {
+                let mut visitor = MacroVisitor {
+                    expander: self,
+                    exprs: Vec::new(),
+                };
+                visitor.visit_expr(expr);
+                visitor.exprs
+            };
+            let _ = stream::futures_ordered(exprs.into_iter().map(move |(expr, future)| {
+                future.then(move |result| -> Result<_, ()> {
+                    match result {
+                        Ok(mut replacement) => {
+                            replacement.span = expr.span;
+                            *expr = replacement;
+                            Ok(None)
+                        }
+                        Err(err) => {
+                            *expr = pos::spanned(expr.span, Expr::Error(None));
+
+                            Ok(Some(pos::spanned(expr.span, err)))
+                        }
+                    }
+                })
+            })).for_each(|err| -> Result<(), ()> {
+                if let Some(err) = err {
+                    self.errors.push(err);
+                }
+                Ok(())
+            })
+                .wait();
+        }
+        if self.errors.has_errors() {
+            info!("Macro errors: {}", self.errors);
+        }
     }
 }
 
+struct MacroVisitor<'a: 'b, 'b, 'c> {
+    expander: &'b mut MacroExpander<'a>,
+    exprs: Vec<(&'c mut SpannedExpr<Symbol>, MacroFuture)>,
+}
 
-impl<'a> MutVisitor for MacroExpander<'a> {
+impl<'a, 'b, 'c> MutVisitor<'c> for MacroVisitor<'a, 'b, 'c> {
     type Ident = Symbol;
 
-    fn visit_expr(&mut self, expr: &mut SpannedExpr<Symbol>) {
+    fn visit_expr(&mut self, expr: &'c mut SpannedExpr<Symbol>) {
         let replacement = match expr.value {
-            Expr::App(ref mut id, ref mut args) => match id.value {
+            Expr::App {
+                ref mut implicit_args,
+                func: ref mut id,
+                ref mut args,
+            } => match id.value {
                 Expr::Ident(ref id) if id.name.as_ref().ends_with('!') => {
+                    if !implicit_args.is_empty() {
+                        self.expander.errors.push(pos::spanned(
+                            expr.span,
+                            "Implicit arguments are not allowed on macros".into(),
+                        ));
+                    }
+
                     let name = id.name.as_ref();
-                    match self.macros.get(&name[..name.len() - 1]) {
-                        Some(m) => Some(match m.expand(self, args) {
-                            Ok(e) => e,
-                            Err(err) => {
-                                self.errors.push(err);
-                                pos::spanned(expr.span, Expr::Error)
-                            }
-                        }),
+                    match self.expander.macros.get(&name[..name.len() - 1]) {
+                        Some(m) => Some(m.expand(self.expander, mem::replace(args, Vec::new()))),
                         None => None,
                     }
                 }
@@ -130,10 +178,10 @@ impl<'a> MutVisitor for MacroExpander<'a> {
             },
             _ => None,
         };
-        if let Some(mut e) = replacement {
-            e.span = expr.span;
-            *expr = e;
+        if let Some(future) = replacement {
+            self.exprs.push((expr, future));
+        } else {
+            ast::walk_mut_expr(self, expr);
         }
-        ast::walk_mut_expr(self, expr);
     }
 }

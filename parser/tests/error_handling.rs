@@ -7,8 +7,8 @@ extern crate gluon_parser as parser;
 
 mod support;
 
-use base::ast::{Pattern, PatternField, TypedIdent};
-use base::pos::{self, BytePos, Spanned};
+use base::ast::{Expr, Pattern, PatternField, TypedIdent};
+use base::pos::{self, BytePos, Span, Spanned};
 use base::types::Type;
 
 use parser::{Error, ParseErrors, TokenizeError};
@@ -19,10 +19,11 @@ use support::*;
 fn remove_expected(errors: ParseErrors) -> ParseErrors {
     let f = |mut err: Spanned<Error, _>| {
         match err.value {
-            Error::UnexpectedToken(_, ref mut expected) |
-            Error::UnexpectedEof(ref mut expected) => expected.clear(),
+            Error::UnexpectedToken(_, ref mut expected)
+            | Error::UnexpectedEof(ref mut expected) => expected.clear(),
             _ => (),
         }
+        err.span = Span::default();
         err
     };
     ParseErrors::from(errors.into_iter().map(f).collect::<Vec<_>>())
@@ -30,7 +31,7 @@ fn remove_expected(errors: ParseErrors) -> ParseErrors {
 
 #[test]
 fn empty_input() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let result = parse("");
     assert!(result.is_err());
@@ -47,7 +48,7 @@ fn empty_input() {
 
 #[test]
 fn missing_match_expr() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let expr = r#"
     match with
@@ -57,15 +58,15 @@ fn missing_match_expr() {
     assert!(result.is_err());
     let (expr, err) = result.unwrap_err();
     assert_eq!(
-        expr,
-        Some(case(
+        clear_span(expr.unwrap()),
+        case(
             error(),
             vec![(Pattern::Ident(TypedIdent::new(intern("x"))), id("x"))],
-        ),)
+        )
     );
 
     let error = Error::UnexpectedToken("With".into(), vec![]);
-    let span = pos::span(BytePos::from(11), BytePos::from(15));
+    let span = pos::span(BytePos::from(0), BytePos::from(0));
     assert_eq!(
         remove_expected(err),
         ParseErrors::from(vec![pos::spanned(span, error)])
@@ -74,7 +75,7 @@ fn missing_match_expr() {
 
 #[test]
 fn wrong_indent_expression() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let result = parse(
         r#"
@@ -86,15 +87,15 @@ y
 "#,
     );
     let error = Error::UnexpectedToken("IntLiteral".into(), vec![]);
-    let span = pos::span(BytePos::from(32), BytePos::from(32));
+    let span = pos::span(BytePos::from(0), BytePos::from(0));
     let errors = ParseErrors::from(vec![pos::spanned(span, error)]);
 
-    assert_eq!(result.map_err(|(_, err)| remove_expected(err)), Err(errors));
+    assert_eq!(remove_expected(result.unwrap_err().1), errors);
 }
 
 #[test]
 fn unclosed_string() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let result = parse(
         r#"
@@ -106,7 +107,7 @@ fn unclosed_string() {
 
 #[test]
 fn tokenizer_error_is_returned() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let result = parse(
         r#"
@@ -118,12 +119,12 @@ fn tokenizer_error_is_returned() {
     let span = pos::span(BytePos::from(0), BytePos::from(0));
     let errors = ParseErrors::from(vec![pos::spanned(span, error)]);
 
-    assert_eq!(result.map_err(|(_, err)| err), Err(errors));
+    assert_eq!(remove_expected(result.unwrap_err().1), errors);
 }
 
 #[test]
 fn tokenizer_error_at_eof_is_returned() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let result = parse(
         r#"
@@ -135,12 +136,12 @@ fn tokenizer_error_at_eof_is_returned() {
     let span = pos::span(BytePos::from(0), BytePos::from(0));
     let errors = ParseErrors::from(vec![pos::spanned(span, error)]);
 
-    assert_eq!(result.map_err(|(_, err)| err), Err(errors));
+    assert_eq!(remove_expected(result.unwrap_err().1), errors);
 }
 
 #[test]
 fn no_infinite_loop_from_default_block() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let result = parse(
         r#"
@@ -156,7 +157,7 @@ let x = 1
 
 #[test]
 fn missing_pattern() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let expr = r#"
     match 1 with
@@ -165,10 +166,13 @@ fn missing_pattern() {
     let result = parse(expr);
     assert!(result.is_err());
     let (expr, err) = result.unwrap_err();
-    assert_eq!(expr, Some(case(int(1), vec![(Pattern::Error, id("x"))])));
+    assert_eq!(
+        clear_span(expr.unwrap()),
+        case(int(1), vec![(Pattern::Error, id("x"))])
+    );
 
     let error = Error::UnexpectedToken("RArrow".into(), vec![]);
-    let span = pos::span(BytePos::from(24), BytePos::from(26));
+    let span = pos::span(BytePos::from(0), BytePos::from(0));
     assert_eq!(
         remove_expected(err),
         ParseErrors::from(vec![pos::spanned(span, error)])
@@ -177,7 +181,7 @@ fn missing_pattern() {
 
 #[test]
 fn incomplete_alternative() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let expr = r#"
     match 1 with
@@ -186,10 +190,13 @@ fn incomplete_alternative() {
     let result = parse(expr);
     assert!(result.is_err());
     let (expr, err) = result.unwrap_err();
-    assert_eq!(expr, Some(case(int(1), vec![(Pattern::Error, error())])));
+    assert_eq!(
+        clear_span(expr.unwrap()),
+        case(int(1), vec![(Pattern::Error, error())])
+    );
 
     let error = Error::UnexpectedToken("CloseBlock".into(), vec![]);
-    let span = pos::span(BytePos::from(24), BytePos::from(26));
+    let span = pos::span(BytePos::from(0), BytePos::from(0));
     assert_eq!(
         remove_expected(err),
         ParseErrors::from(vec![pos::spanned(span, error)])
@@ -198,7 +205,7 @@ fn incomplete_alternative() {
 
 #[test]
 fn incomplete_alternative_before_complete_alternative() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let expr = r#"
     match 1 with
@@ -209,18 +216,18 @@ fn incomplete_alternative_before_complete_alternative() {
     assert!(result.is_err());
     let (expr, err) = result.unwrap_err();
     assert_eq!(
-        expr,
-        Some(case(
+        clear_span(expr.unwrap()),
+        case(
             int(1),
             vec![
                 (Pattern::Error, error()),
                 (Pattern::Ident(TypedIdent::new(intern("x"))), id("x")),
             ],
-        ),)
+        )
     );
 
     let error = Error::UnexpectedToken("Pipe".into(), vec![]);
-    let span = pos::span(BytePos::from(24), BytePos::from(24));
+    let span = pos::span(BytePos::from(0), BytePos::from(0));
     assert_eq!(
         remove_expected(err),
         ParseErrors::from(vec![pos::spanned(span, error)])
@@ -229,7 +236,7 @@ fn incomplete_alternative_before_complete_alternative() {
 
 #[test]
 fn incomplete_alternative_with_partial_pattern() {
-    let _ = ::env_logger::init();
+    let _ = ::env_logger::try_init();
 
     let expr = r#"
     match 1 with
@@ -239,8 +246,8 @@ fn incomplete_alternative_with_partial_pattern() {
     assert!(result.is_err());
     let (expr, err) = result.unwrap_err();
     assert_eq!(
-        expr,
-        Some(case(
+        clear_span(expr.unwrap()),
+        case(
             int(1),
             vec![
                 (
@@ -253,11 +260,12 @@ fn incomplete_alternative_with_partial_pattern() {
                                 value: Some(no_loc(Pattern::Error)),
                             },
                         ],
+                        implicit_import: None,
                     },
                     error(),
                 ),
             ],
-        ),)
+        )
     );
 
     let errors = vec![
@@ -265,4 +273,62 @@ fn incomplete_alternative_with_partial_pattern() {
         no_loc(Error::UnexpectedToken("CloseBlock".into(), vec![])),
     ];
     assert_eq!(remove_expected(err), ParseErrors::from(errors));
+}
+
+#[test]
+fn incomplete_let_binding() {
+    let _ = ::env_logger::try_init();
+
+    let expr = r#"
+    let test =
+    1
+    "#;
+    let result = parse(expr);
+    assert!(result.is_err());
+    let (expr, err) = result.unwrap_err();
+    assert_eq!(
+        clear_span(expr.unwrap()),
+        let_("test", no_loc(Expr::Error(None)), int(1),)
+    );
+
+    let errors = vec![no_loc(Error::UnexpectedToken("CloseBlock".into(), vec![]))];
+    assert_eq!(remove_expected(err), ParseErrors::from(errors));
+}
+
+#[test]
+fn incomplete_let_binding_2() {
+    let _ = ::env_logger::try_init();
+
+    let expr = r#"
+    let test = io
+    "#;
+    let result = parse(expr);
+    assert!(result.is_err());
+    let (expr, err) = result.unwrap_err();
+    assert_eq!(
+        clear_span(expr.unwrap()),
+        let_("test", id("io"), no_loc(Expr::Error(None)))
+    );
+
+    let errors = vec![
+        no_loc(Error::UnexpectedToken("CloseBlock".into(), vec![])),
+        no_loc(Error::UnexpectedToken("CloseBlock".into(), vec![])),
+    ];
+    assert_eq!(remove_expected(err), ParseErrors::from(errors));
+}
+
+#[test]
+fn unterminated_char_literal() {
+    let _ = ::env_logger::try_init();
+
+    let expr = r#"
+    'a
+    "#;
+    let result = parse(expr);
+    assert!(result.is_err());
+    let (_expr, err) = result.unwrap_err();
+
+    let error = Error::Token(TokenizeError::UnterminatedCharLiteral);
+    let span = pos::span(BytePos::from(5), BytePos::from(5));
+    assert_eq!(err, ParseErrors::from(vec![pos::spanned(span, error)]));
 }

@@ -1,15 +1,15 @@
 //! The parser is a bit more complex than it needs to be as it needs to be fully specialized to
 //! avoid a recompilation every time a later part of the compiler is changed. Due to this the
 //! string interner and therefore also garbage collector needs to compiled before the parser.
-#![doc(html_root_url = "https://docs.rs/gluon_parser/0.6.1")] // # GLUON
+#![doc(html_root_url = "https://docs.rs/gluon_parser/0.7.1")] // # GLUON
 
-#[macro_use]
 extern crate collect_mac;
 extern crate gluon_base as base;
 extern crate itertools;
 extern crate lalrpop_util;
 #[macro_use]
 extern crate log;
+extern crate ordered_float;
 extern crate pretty;
 #[macro_use]
 extern crate quick_error;
@@ -17,7 +17,7 @@ extern crate quick_error;
 use std::cell::RefCell;
 use std::fmt;
 
-use base::ast::{Comment, Expr, IdentEnv, SpannedExpr, SpannedPattern, TypedIdent, ValueBinding};
+use base::ast::{Comment, Do, Expr, IdentEnv, SpannedExpr, SpannedPattern, TypedIdent, ValueBinding};
 use base::error::Errors;
 use base::pos::{self, BytePos, Span, Spanned};
 use base::symbol::Symbol;
@@ -44,19 +44,17 @@ fn new_ident<Id>(type_cache: &TypeCache<Id, ArcType<Id>>, name: Id) -> TypedIden
     }
 }
 
-type LalrpopError<'input> = lalrpop_util::ParseError<
-    BytePos,
-    Token<'input>,
-    Spanned<Error, BytePos>,
->;
+type LalrpopError<'input> =
+    lalrpop_util::ParseError<BytePos, Token<'input>, Spanned<Error, BytePos>>;
 
 /// Shrink hidden spans to fit the visible expressions and flatten singleton blocks.
 fn shrink_hidden_spans<Id>(mut expr: SpannedExpr<Id>) -> SpannedExpr<Id> {
     match expr.value {
-        Expr::Infix(_, _, ref last) |
-        Expr::IfElse(_, _, ref last) |
-        Expr::LetBindings(_, ref last) |
-        Expr::TypeBindings(_, ref last) => expr.span.end = last.span.end,
+        Expr::Infix { rhs: ref last, .. }
+        | Expr::IfElse(_, _, ref last)
+        | Expr::LetBindings(_, ref last)
+        | Expr::TypeBindings(_, ref last)
+        | Expr::Do(Do { body: ref last, .. }) => expr.span.end = last.span.end,
         Expr::Lambda(ref lambda) => expr.span.end = lambda.body.span.end,
         Expr::Block(ref mut exprs) => match exprs.len() {
             0 => (),
@@ -67,14 +65,14 @@ fn shrink_hidden_spans<Id>(mut expr: SpannedExpr<Id>) -> SpannedExpr<Id> {
             let end = last_alt.expr.span.end;
             expr.span.end = end;
         },
-        Expr::App(_, _) |
-        Expr::Ident(_) |
-        Expr::Literal(_) |
-        Expr::Projection(_, _, _) |
-        Expr::Array(_) |
-        Expr::Record { .. } |
-        Expr::Tuple { .. } |
-        Expr::Error => (),
+        Expr::App { .. }
+        | Expr::Ident(_)
+        | Expr::Literal(_)
+        | Expr::Projection(_, _, _)
+        | Expr::Array(_)
+        | Expr::Record { .. }
+        | Expr::Tuple { .. }
+        | Expr::Error(..) => (),
     }
     expr
 }
@@ -277,25 +275,26 @@ type ErrorEnv<'err, 'input> = &'err mut Errors<LalrpopError<'input>>;
 pub type ParseErrors = Errors<Spanned<Error, BytePos>>;
 
 macro_rules! layout {
-    ($result_ok_iter: ident, $input: expr) => { {
+    ($result_ok_iter:ident, $input:expr) => {{
         let tokenizer = Tokenizer::new($input);
         $result_ok_iter = RefCell::new(ResultOkIter::new(tokenizer));
 
         Layout::new(SharedIter::new(&$result_ok_iter)).map(|token| {
             // Return the tokenizer error if one exists
-            $result_ok_iter.borrow_mut()
-                .result(())
-                .map_err(|err| {
-                    pos::spanned2(err.span.start.absolute,
-                                err.span.end.absolute,
-                                err.value.into())
-                })?;
+            $result_ok_iter.borrow_mut().result(()).map_err(|err| {
+                pos::spanned2(
+                    err.span.start.absolute,
+                    err.span.end.absolute,
+                    err.value.into(),
+                )
+            })?;
             let token = token.map_err(|err| pos::spanned(err.span, err.value.into()))?;
             debug!("Lex {:?}", token.value);
             let Span { start, end, .. } = token.span;
             Ok((start.absolute, token.value, end.absolute))
         })
-    } }
+    }
+    }
 }
 
 pub fn parse_partial_expr<Id>(
@@ -311,7 +310,7 @@ where
 
     let mut parse_errors = Errors::new();
 
-    let result = grammar::parse_TopExpr(input, type_cache, symbols, &mut parse_errors, layout);
+    let result = grammar::TopExprParser::new().parse(input, type_cache, symbols, &mut parse_errors, layout);
 
     // If there is a tokenizer error it may still exist in the result iterator wrapper.
     // If that is the case we return that error instead of the unexpected EOF error that lalrpop
@@ -372,7 +371,7 @@ where
 
     let type_cache = TypeCache::new();
 
-    let result = grammar::parse_LetOrExpr(input, &type_cache, symbols, &mut parse_errors, layout);
+    let result = grammar::LetOrExprParser::new().parse(input, &type_cache, symbols, &mut parse_errors, layout);
 
     // If there is a tokenizer error it may still exist in the result iterator wrapper.
     // If that is the case we return that error instead of the unexpected EOF error that lalrpop

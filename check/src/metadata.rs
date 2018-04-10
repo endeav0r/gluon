@@ -1,10 +1,37 @@
 use std::collections::BTreeMap;
 
-use base::ast::{self, Expr, Pattern, SpannedExpr, SpannedPattern, ValueBinding};
+use base::ast::{self, AstType, Commented, Expr, Pattern, SpannedExpr, SpannedPattern, ValueBinding};
 use base::ast::Visitor;
 use base::fnv::FnvMap;
 use base::metadata::{Metadata, MetadataEnv};
 use base::symbol::{Name, Symbol};
+use base::types::row_iter;
+
+pub struct AttributesIter<'a> {
+    comment: ::std::str::Lines<'a>,
+}
+
+impl<'a> Iterator for AttributesIter<'a> {
+    type Item = (&'a str, Option<&'a str>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(line) = self.comment.next() {
+            if line.starts_with('@') {
+                let mut split = line[1..].splitn(2, ' ');
+                if let Some(x) = split.next().map(|key| (key, split.next())) {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    }
+}
+
+pub fn attributes(comment: &str) -> AttributesIter {
+    AttributesIter {
+        comment: comment.lines(),
+    }
+}
 
 struct Environment<'b> {
     env: &'b MetadataEnv,
@@ -23,16 +50,26 @@ pub fn metadata(
     impl<'b> MetadataVisitor<'b> {
         fn new_binding(&mut self, metadata: Metadata, bind: &ValueBinding<Symbol>) {
             match bind.name.value {
+                Pattern::As(ref id, _) => {
+                    let metadata = bind.comment.as_ref().map_or(metadata, |comment| Metadata {
+                        comment: Some(comment.content.clone()),
+                        module: BTreeMap::new(),
+                    });
+                    self.stack_var(id.clone(), metadata.clone());
+                    self.new_pattern(metadata, &bind.name);
+                }
                 Pattern::Ident(ref id) => {
-                    let metadata = bind.comment.as_ref().map_or(metadata, |comment| {
-                        Metadata {
-                            comment: Some(comment.content.clone()),
-                            module: BTreeMap::new(),
-                        }
+                    let metadata = bind.comment.as_ref().map_or(metadata, |comment| Metadata {
+                        comment: Some(comment.content.clone()),
+                        module: BTreeMap::new(),
                     });
                     self.stack_var(id.name.clone(), metadata);
                 }
-                _ => self.new_pattern(metadata, &bind.name),
+                Pattern::Constructor(..)
+                | Pattern::Tuple { .. }
+                | Pattern::Record { .. }
+                | Pattern::Literal(_)
+                | Pattern::Error => self.new_pattern(metadata, &bind.name),
             }
         }
 
@@ -41,8 +78,13 @@ pub fn metadata(
                 Pattern::Record {
                     ref fields,
                     ref types,
-                    ..
+                    ref typ,
+                    ref implicit_import,
                 } => {
+                    if let Some(ref implicit_import) = *implicit_import {
+                        self.stack_var(implicit_import.value.clone(), metadata.clone());
+                    }
+
                     for field in fields {
                         if let Some(m) = metadata.module.remove(field.name.value.as_ref()) {
                             let id = match field.value {
@@ -57,6 +99,13 @@ pub fn metadata(
                     }
                     for field in types {
                         if let Some(m) = metadata.module.remove(field.name.value.as_ref()) {
+                            // FIXME Shouldn't need to insert this metadata twice
+                            if let Some(type_field) = typ.type_field_iter()
+                                .find(|type_field| type_field.name.name_eq(&field.name.value))
+                            {
+                                self.stack_var(type_field.typ.name.clone(), m.clone());
+                            }
+
                             let id = field
                                 .value
                                 .as_ref()
@@ -66,10 +115,15 @@ pub fn metadata(
                         }
                     }
                 }
-                Pattern::Ident(ref id) => {
-                    self.stack_var(id.name.clone(), metadata);
+                Pattern::Ident(ref id) => self.stack_var(id.name.clone(), metadata),
+                Pattern::As(ref id, ref pat) => {
+                    self.stack_var(id.clone(), metadata.clone());
+                    self.new_pattern(metadata, pat);
                 }
-                Pattern::Tuple { .. } | Pattern::Constructor(..) | Pattern::Error => (),
+                Pattern::Tuple { .. }
+                | Pattern::Constructor(..)
+                | Pattern::Literal(_)
+                | Pattern::Error => (),
             }
         }
 
@@ -111,11 +165,9 @@ pub fn metadata(
                             }
                             None => self.metadata(&field.name.value).cloned(),
                         };
-                        let field_metadata = field.comment.clone().map(|comment| {
-                            Metadata {
-                                comment: Some(comment.content),
-                                module: BTreeMap::new(),
-                            }
+                        let field_metadata = field.comment.clone().map(|comment| Metadata {
+                            comment: Some(comment.content),
+                            module: BTreeMap::new(),
                         });
                         let maybe_metadata = match (field_metadata, maybe_metadata) {
                             (Some(l), Some(r)) => Some(l.merge(r)),
@@ -158,13 +210,16 @@ pub fn metadata(
                 }
                 Expr::TypeBindings(ref bindings, ref expr) => {
                     for bind in bindings {
-                        let maybe_metadata = bind.comment.as_ref().map(|comment| {
-                            Metadata {
-                                comment: Some(comment.content.clone()),
-                                module: BTreeMap::new(),
-                            }
-                        });
-                        if let Some(metadata) = maybe_metadata {
+                        let mut type_metadata =
+                            Self::metadata_of_type(bind.alias.value.unresolved_type());
+                        if let Some(ref comment) = bind.comment {
+                            let mut metadata = type_metadata.unwrap_or_default();
+                            metadata.comment = Some(comment.content.clone());
+                            type_metadata = Some(metadata);
+                        }
+                        if let Some(metadata) = type_metadata {
+                            // FIXME Shouldn't need to insert this metadata twice
+                            self.stack_var(bind.alias.value.name.clone(), metadata.clone());
                             self.stack_var(bind.name.value.clone(), metadata);
                         }
                     }
@@ -183,6 +238,32 @@ pub fn metadata(
                     ast::walk_expr(self, expr);
                     Metadata::default()
                 }
+            }
+        }
+
+        fn metadata_of_type(typ: &AstType<Symbol>) -> Option<Metadata> {
+            let module: BTreeMap<_, _> = row_iter(typ)
+                .filter_map(|field| {
+                    let field_metadata = Self::metadata_of_type(&field.typ);
+                    let field_metadata = match field.typ.comment() {
+                        Some(comment) => {
+                            let mut metadata = field_metadata.unwrap_or_default();
+                            metadata.comment = Some(comment.content.clone());
+                            Some(metadata)
+                        }
+                        None => field_metadata,
+                    };
+                    field_metadata.map(|m| (field.name.to_string(), m))
+                })
+                .collect();
+
+            if module.is_empty() {
+                None
+            } else {
+                Some(Metadata {
+                    comment: None,
+                    module,
+                })
             }
         }
     }

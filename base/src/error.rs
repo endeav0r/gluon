@@ -17,6 +17,12 @@ pub struct Errors<T> {
     errors: Vec<T>,
 }
 
+impl<T> Default for Errors<T> {
+    fn default() -> Self {
+        Errors::new()
+    }
+}
+
 impl<T> Errors<T> {
     /// Creates a new, empty `Errors` instance.
     pub fn new() -> Errors<T> {
@@ -131,8 +137,18 @@ struct SourceContext<E> {
     error: Spanned<E, Location>,
 }
 
-impl<E> SourceContext<E> {
+impl<E> SourceContext<E>
+where
+    E: fmt::Display,
+{
     fn new(source: &Source, error: Spanned<E, BytePos>) -> SourceContext<E> {
+        debug_assert!(
+            error.span.start.to_usize() <= source.src().len()
+                && error.span.end.to_usize() <= source.src().len(),
+            "{}",
+            error,
+        );
+
         let start = source.location(error.span.start).unwrap();
         let end = source.location(error.span.end).unwrap();
         let (_, line) = source.line_at_byte(error.span.start).unwrap();
@@ -144,7 +160,7 @@ impl<E> SourceContext<E> {
     }
 }
 
-/// Error type which contains information of which file and where in the file the error occured
+/// Error type which contains information of which file and where in the file the error occurred
 #[derive(Debug, PartialEq)]
 pub struct InFile<E> {
     pub source_name: String,
@@ -152,7 +168,7 @@ pub struct InFile<E> {
 }
 
 impl<E: fmt::Display> InFile<E> {
-    /// Creates a new `InFile` error which states that the error occured in `file` using the file
+    /// Creates a new `InFile` error which states that the error occurred in `file` using the file
     /// contents in `source` to provide a context to the span.
     pub fn new(source_name: &str, source: &str, error: Errors<Spanned<E, BytePos>>) -> InFile<E> {
         let source = Source::new(source);
@@ -201,5 +217,32 @@ impl<E: fmt::Display> fmt::Display for InFile<E> {
 impl<E: fmt::Display + fmt::Debug + Any> StdError for InFile<E> {
     fn description(&self) -> &str {
         "Error in file"
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Help<E, H> {
+    pub error: E,
+    pub help: Option<H>,
+}
+
+impl<E, H> fmt::Display for Help<E, H>
+where
+    E: fmt::Display,
+    H: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.error)?;
+        if let Some(ref help) = self.help {
+            writeln!(f)?;
+            write!(f, "help: {}", help)?;
+        }
+        Ok(())
+    }
+}
+
+impl<E, H> From<E> for Help<E, H> {
+    fn from(error: E) -> Help<E, H> {
+        Help { error, help: None }
     }
 }

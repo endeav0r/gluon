@@ -37,7 +37,7 @@ use futures::sync::mpsc::Sender;
 
 use base::types::{ArcType, Type};
 
-use vm::{Error as VmError, Result as VmResult};
+use vm::{Error as VmError, ExternModule, Result as VmResult};
 
 use vm::thread::ThreadInternal;
 use vm::thread::{Context, RootedThread, Thread};
@@ -45,6 +45,7 @@ use vm::Variants;
 use vm::api::{Function, FunctionRef, FutureResult, Getable, OpaqueValue, PushAsRef, Pushable,
               Userdata, ValueRef, VmType, WithVM, IO};
 use vm::gc::{Gc, Traverseable};
+use gluon::import::add_extern_module;
 
 use vm::internal::Value;
 
@@ -92,15 +93,15 @@ define_vmtype! { Method }
 impl<'vm> Pushable<'vm> for Wrap<Method> {
     fn push(self, _: &'vm Thread, context: &mut Context) -> VmResult<()> {
         use hyper::Method::*;
-        context.stack.push(Value::Tag(match self.0 {
+        context.stack.push(Value::tag(match self.0 {
             Get => 0,
             Post => 1,
             Delete => 2,
             _ => {
-                return Err(
-                    VmError::Message(format!("Method `{:?}` does not exist in gluon", self.0))
-                        .into(),
-                )
+                return Err(VmError::Message(format!(
+                    "Method `{:?}` does not exist in gluon",
+                    self.0
+                )).into())
             }
         }));
         Ok(())
@@ -110,24 +111,22 @@ impl<'vm> Pushable<'vm> for Wrap<Method> {
 define_vmtype! { StatusCode }
 
 impl<'vm> Getable<'vm> for Wrap<StatusCode> {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<Self> {
+    fn from_value(_: &'vm Thread, value: Variants) -> Self {
         use hyper::StatusCode::*;
         match value.as_ref() {
-            ValueRef::Data(data) => Some(Wrap(match data.tag() {
+            ValueRef::Data(data) => Wrap(match data.tag() {
                 0 => Ok,
                 1 => NotFound,
                 2 => InternalServerError,
                 _ => panic!("Unexpected tag"),
-            })),
+            }),
             _ => panic!(),
         }
     }
 }
 
 // Representation of a http body that is in the prograss of being read
-pub struct Body(
-    Arc<Mutex<Box<Stream<Item = PushAsRef<Chunk, [u8]>, Error = VmError> + Send + 'static>>>,
-);
+pub struct Body(Arc<Mutex<Box<Stream<Item = PushAsRef<Chunk, [u8]>, Error = VmError> + Send>>>);
 
 // By implementing `Userdata` on `Body` it can be automatically pushed and retrieved from gluon
 // threads
@@ -261,8 +260,7 @@ fn listen(port: i32, value: WithVM<OpaqueValue<RootedThread, Handler<Response>>>
 
     // Retrieve the `handle` function from the http module which we use to evaluate values of type
     // `Handler Response`
-    type ListenFn = fn(OpaqueValue<RootedThread, Handler<Response>>, HttpState)
-        -> IO<Response>;
+    type ListenFn = fn(OpaqueValue<RootedThread, Handler<Response>>, HttpState) -> IO<Response>;
     let handle: Function<RootedThread, ListenFn> = thread
         .get_global("examples.http.handle")
         .unwrap_or_else(|err| panic!("{}", err));
@@ -357,16 +355,15 @@ pub fn load_types(vm: &Thread) -> VmResult<()> {
     Ok(())
 }
 
-pub fn load(vm: &Thread) -> VmResult<()> {
-    vm.define_global(
-        "http_prim",
+pub fn load(vm: &Thread) -> VmResult<ExternModule> {
+    ExternModule::new(
+        vm,
         record! {
             listen => primitive!(2 listen),
             read_chunk => primitive!(1 read_chunk),
             write_response => primitive!(2 write_response)
         },
-    )?;
-    Ok(())
+    )
 }
 
 fn main() {
@@ -376,7 +373,7 @@ fn main() {
 }
 
 fn main_() -> Result<(), Box<StdError>> {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
     let port = env::args()
         .nth(1)
         .map(|port| port.parse::<i32>().expect("port"))
@@ -393,7 +390,7 @@ fn main_() -> Result<(), Box<StdError>> {
     )?;
 
     // Load the primitive functions we define in this module
-    load(&thread)?;
+    add_extern_module(&thread, "http.prim", load);
 
     // Last we run our `http_server.glu` module which returns a function which starts listening
     // on the port we passed from the command line

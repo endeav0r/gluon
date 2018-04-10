@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use pretty::{Doc, DocAllocator, DocBuilder};
 
-use symbol::SymbolRef;
+use ast::EmptyEnv;
+use symbol::{Symbol, SymbolRef};
 use types::{ToDoc, Walker};
 
-/// Trait for values which contains kinded values which can be refered by name
+/// Trait for values which contains kinded values which can be referred by name
 pub trait KindEnv {
     /// Returns the kind of the type `type_name`
     fn find_kind(&self, type_name: &SymbolRef) -> Option<ArcKind>;
@@ -18,6 +19,13 @@ impl<'a, T: ?Sized + KindEnv> KindEnv for &'a T {
         (**self).find_kind(id)
     }
 }
+
+impl KindEnv for EmptyEnv<Symbol> {
+    fn find_kind(&self, _id: &SymbolRef) -> Option<ArcKind> {
+        None
+    }
+}
+
 
 /// Kind representation
 ///
@@ -96,7 +104,6 @@ impl<'a, A, E> ToDoc<'a, A, E> for ArcKind {
     }
 }
 
-
 impl<'a> fmt::Display for DisplayKind<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self.1 {
@@ -174,19 +181,19 @@ impl fmt::Display for ArcKind {
 
 type_cache! { KindCache() { ArcKind, Kind } row hole typ }
 
-impl<F: ?Sized> Walker<ArcKind> for F
+impl<'a, F: ?Sized> Walker<'a, ArcKind> for F
 where
     F: FnMut(&ArcKind),
 {
-    fn walk(&mut self, typ: &ArcKind) {
+    fn walk(&mut self, typ: &'a ArcKind) {
         self(typ);
         walk_kind(typ, self)
     }
 }
 
-pub fn walk_kind<F: ?Sized>(k: &ArcKind, f: &mut F)
+pub fn walk_kind<'a, F: ?Sized>(k: &'a ArcKind, f: &mut F)
 where
-    F: Walker<ArcKind>,
+    F: Walker<'a, ArcKind>,
 {
     match **k {
         Kind::Function(ref a, ref r) => {

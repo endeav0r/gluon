@@ -1,8 +1,9 @@
 #[allow(unused_extern_crates)]
 extern crate env_logger;
+pub extern crate futures;
 #[allow(unused_extern_crates)]
 extern crate gluon;
-pub extern crate futures;
+extern crate tokio_core;
 
 use gluon::vm::api::{Getable, VmType};
 use gluon::vm::thread::{RootedThread, Thread};
@@ -40,7 +41,11 @@ where
 
 /// Creates a VM for testing which has the correct paths to import the std library properly
 pub fn make_vm() -> RootedThread {
-    let vm = ::gluon::new_vm();
+    make_async_vm(None)
+}
+
+pub fn make_async_vm(remote: Option<self::tokio_core::reactor::Remote>) -> RootedThread {
+    let vm = ::gluon::VmBuilder::new().event_loop(remote).build();
     let import = vm.get_macros().get("import");
     import
         .as_ref()
@@ -55,9 +60,9 @@ macro_rules! test_expr {
     (prelude $name: ident, $expr: expr, $value: expr) => {
         #[test]
         fn $name() {
-            let _ = ::env_logger::init();
-            let mut vm = make_vm();
-            let value = run_expr_(&mut vm, $expr, true);
+            let _ = ::env_logger::try_init();
+            let mut vm = $crate::support::make_vm();
+            let value = $crate::support::run_expr_(&mut vm, $expr, true);
             assert_eq!(value, $value);
 
             // Help out the type inference by forcing that left and right are the same types
@@ -68,11 +73,14 @@ macro_rules! test_expr {
     (io $name: ident, $expr: expr, $value: expr) => {
         #[test]
         fn $name() {
-            let _ = ::env_logger::init();
-            let mut vm = make_vm();
-            let (value, _) = Compiler::new()
+            use gluon::vm::api::IO;
+
+            let _ = ::env_logger::try_init();
+            let mut vm = $crate::support::make_vm();
+            let (value, _) = ::gluon::Compiler::new()
                 .implicit_prelude(false)
-                .run_io_expr(&mut vm, "<top>", $expr)
+                .run_io(true)
+                .run_expr(&mut vm, "<top>", $expr)
                 .unwrap_or_else(|err| panic!("{}", err));
             match value {
                 IO::Value(value) => {
@@ -89,18 +97,18 @@ macro_rules! test_expr {
     (any $name: ident, $expr: expr, $value: expr) => {
         #[test]
         fn $name() {
-            let _ = ::env_logger::init();
-            let mut vm = make_vm();
-            let value = run_expr::<OpaqueValue<&Thread, Hole>>(&mut vm, $expr);
+            let _ = ::env_logger::try_init();
+            let mut vm = $crate::support::make_vm();
+            let value = $crate::support::run_expr::<OpaqueValue<&Thread, Hole>>(&mut vm, $expr);
             assert_eq!(value.get_ref(), $value);
         }
     };
     ($name: ident, $expr: expr, $value: expr) => {
         #[test]
         fn $name() {
-            let _ = ::env_logger::init();
-            let mut vm = make_vm();
-            let value = run_expr(&mut vm, $expr);
+            let _ = ::env_logger::try_init();
+            let mut vm = $crate::support::make_vm();
+            let value = $crate::support::run_expr(&mut vm, $expr);
             assert_eq!(value, $value);
 
             // Help out the type inference by forcing that left and right are the same types
@@ -111,9 +119,9 @@ macro_rules! test_expr {
     ($name: ident, $expr: expr) => {
         #[test]
         fn $name() {
-            let _ = ::env_logger::init();
-            let mut vm = make_vm();
-            run_expr::<OpaqueValue<&Thread, Hole>>(&mut vm, $expr);
+            let _ = ::env_logger::try_init();
+            let mut vm = $crate::support::make_vm();
+            $crate::support::run_expr::<OpaqueValue<&Thread, Hole>>(&mut vm, $expr);
         }
     }
 }

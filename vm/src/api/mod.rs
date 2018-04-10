@@ -1,14 +1,18 @@
 //! The marshalling api
 use {forget_lifetime, Error, Result, Variants};
-use gc::{DataDef, Gc, Move, Traverseable};
-use base::symbol::Symbol;
-use stack::StackFrame;
+use future::FutureValue;
+use gc::{DataDef, Gc, GcPtr, Move, Traverseable};
+use base::symbol::{Symbol, Symbols};
+use base::scoped_map::ScopedMap;
+use stack::{Lock, StackFrame};
 use vm::{self, Root, RootStr, RootedValue, Status, Thread};
-use value::{ArrayDef, ArrayRepr, Cloner, DataStruct, Def, ExternFunction, GcStr, Value, ValueArray};
-use thread::{self, Context, RootedThread};
+use value::{ArrayDef, ArrayRepr, Cloner, DataStruct, Def, ExternFunction, GcStr, Value,
+            ValueArray, ValueRepr};
+use thread::{self, Context, RootedThread, VmRoot};
 use thread::ThreadInternal;
 use base::types::{self, ArcType, Type};
-use types::{VmIndex, VmInt, VmTag};
+use types::{Instruction, VmIndex, VmInt, VmTag};
+use compiler::{CompiledFunction, CompiledModule};
 
 use std::any::Any;
 use std::cell::Ref;
@@ -21,6 +25,9 @@ use std::result::Result as StdResult;
 use futures::{Async, Future};
 
 pub use value::Userdata;
+
+#[cfg(feature = "serde")]
+use serde::de::{Deserialize, Deserializer};
 
 #[macro_use]
 pub mod mac;
@@ -46,6 +53,7 @@ pub enum ValueRef<'a> {
     Data(Data<'a>),
     Array(ArrayRef<'a>),
     Userdata(&'a vm::Userdata),
+    Thread(&'a Thread),
     Internal,
 }
 
@@ -73,23 +81,23 @@ impl<'a> PartialEq<Value> for ValueRef<'a> {
 
 impl<'a> ValueRef<'a> {
     pub fn new(value: &'a Value) -> ValueRef<'a> {
-        unsafe { ValueRef::rooted_new(*value) }
+        unsafe { ValueRef::rooted_new(value.get_repr()) }
     }
 
-    pub unsafe fn rooted_new(value: Value) -> ValueRef<'a> {
+    pub(crate) unsafe fn rooted_new(value: ValueRepr) -> ValueRef<'a> {
         match value {
-            Value::Byte(i) => ValueRef::Byte(i),
-            Value::Int(i) => ValueRef::Int(i),
-            Value::Float(f) => ValueRef::Float(f),
-            Value::String(s) => ValueRef::String(forget_lifetime(&*s)),
-            Value::Data(data) => ValueRef::Data(Data(DataInner::Data(forget_lifetime(&*data)))),
-            Value::Tag(tag) => ValueRef::Data(Data(DataInner::Tag(tag))),
-            Value::Array(array) => ValueRef::Array(ArrayRef(forget_lifetime(&*array))),
-            Value::Userdata(data) => ValueRef::Userdata(forget_lifetime(&**data)),
-            Value::Thread(_) |
-            Value::Function(_) |
-            Value::Closure(_) |
-            Value::PartialApplication(_) => ValueRef::Internal,
+            ValueRepr::Byte(i) => ValueRef::Byte(i),
+            ValueRepr::Int(i) => ValueRef::Int(i),
+            ValueRepr::Float(f) => ValueRef::Float(f),
+            ValueRepr::String(s) => ValueRef::String(forget_lifetime(&*s)),
+            ValueRepr::Data(data) => ValueRef::Data(Data(DataInner::Data(forget_lifetime(&*data)))),
+            ValueRepr::Tag(tag) => ValueRef::Data(Data(DataInner::Tag(tag))),
+            ValueRepr::Array(array) => ValueRef::Array(ArrayRef(forget_lifetime(&*array))),
+            ValueRepr::Userdata(data) => ValueRef::Userdata(forget_lifetime(&**data)),
+            ValueRepr::Thread(thread) => ValueRef::Thread(forget_lifetime(&*thread)),
+            ValueRepr::Function(_) | ValueRepr::Closure(_) | ValueRepr::PartialApplication(_) => {
+                ValueRef::Internal
+            }
         }
     }
 }
@@ -125,7 +133,15 @@ impl<'a> Data<'a> {
         }
     }
 
-    pub fn get_variants(&self, index: usize) -> Option<Variants<'a>> {
+    pub fn iter(&self) -> ::value::VariantIter {
+        let fields = match self.0 {
+            DataInner::Tag(_) => &[][..],
+            DataInner::Data(data) => &data.fields,
+        };
+        ::value::variant_iter(fields)
+    }
+
+    pub fn get_variant(&self, index: usize) -> Option<Variants<'a>> {
         match self.0 {
             DataInner::Tag(_) => None,
             DataInner::Data(data) => unsafe { data.fields.get(index).map(|v| Variants::new(v)) },
@@ -137,9 +153,11 @@ impl<'a> Data<'a> {
         match self.0 {
             DataInner::Tag(_) => None,
             DataInner::Data(data) => unsafe {
-                thread.lookup_field(data, name).ok().map(|v| {
-                    Variants::with_root(v, data)
-                })
+                GcPtr::from_raw(data)
+                    .get(thread, name)
+                    .ok()
+                    .and_then(|x| x)
+                    .map(|v| Variants(v.get_value().get_repr(), PhantomData))
             },
         }
     }
@@ -161,6 +179,18 @@ impl VmType for Hole {
 pub enum IO<T> {
     Value(T),
     Exception(String),
+}
+
+impl<T, E> From<StdResult<T, E>> for IO<T>
+where
+    E: fmt::Display,
+{
+    fn from(result: StdResult<T, E>) -> IO<T> {
+        match result {
+            Ok(value) => IO::Value(value),
+            Err(err) => IO::Exception(err.to_string()),
+        }
+    }
 }
 
 pub type GluonFunction = extern "C" fn(&Thread) -> Status;
@@ -206,7 +236,13 @@ where
 }
 
 #[derive(PartialEq)]
-pub struct Generic<T>(pub Value, PhantomData<T>);
+pub struct Generic<T>(Value, PhantomData<T>);
+
+impl<T> Generic<T> {
+    pub(crate) unsafe fn get_value(&self) -> Value {
+        self.0.clone()
+    }
+}
 
 impl<T> fmt::Debug for Generic<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -238,8 +274,8 @@ impl<'vm, T: VmType> Pushable<'vm> for Generic<T> {
     }
 }
 impl<'vm, T> Getable<'vm> for Generic<T> {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<Generic<T>> {
-        Some(Generic::from(value.0))
+    fn from_value(_: &'vm Thread, value: Variants) -> Generic<T> {
+        Generic::from(value.get_value())
     }
 }
 
@@ -276,10 +312,59 @@ pub mod generic {
     make_generics!{A B C D E F G H I J K L M N O P Q R X Y Z}
 }
 
+fn insert_forall(
+    variables: &mut ScopedMap<Symbol, types::Generic<Symbol>>,
+    typ: &ArcType,
+) -> Option<ArcType> {
+    variables.enter_scope();
+    let new_type = insert_forall_walker(variables, typ);
+    let params: Vec<_> = variables.exit_scope().map(|(_, generic)| generic).collect();
+
+    if !params.is_empty() {
+        Some(Type::forall(
+            params,
+            new_type.unwrap_or_else(|| typ.clone()),
+        ))
+    } else {
+        new_type
+    }
+}
+
+fn insert_forall_walker(
+    variables: &mut ScopedMap<Symbol, types::Generic<Symbol>>,
+    typ: &ArcType,
+) -> Option<ArcType> {
+    match **typ {
+        Type::Generic(ref generic) => {
+            if variables.get(&generic.id).is_none() {
+                variables.insert(generic.id.clone(), generic.clone());
+            }
+            None
+        }
+        Type::Record(ref typ) => match **typ {
+            Type::ExtendRow { .. } => types::walk_move_type_opt(
+                typ,
+                &mut types::ControlVisitation(|typ: &ArcType| insert_forall(variables, typ)),
+            ).map(|typ| ArcType::from(Type::Record(typ))),
+            _ => None,
+        },
+        _ => types::walk_move_type_opt(
+            typ,
+            &mut types::ControlVisitation(|typ: &ArcType| insert_forall_walker(variables, typ)),
+        ),
+    }
+}
+
 /// Trait which maps a type in rust to a type in gluon
 pub trait VmType {
     /// A version of `Self` which implements `Any` allowing a `TypeId` to be retrieved
     type Type: ?Sized + Any;
+
+    fn make_forall_type(vm: &Thread) -> ArcType {
+        let typ = Self::make_type(vm);
+        let mut variables = ScopedMap::new();
+        insert_forall(&mut variables, &typ).unwrap_or(typ)
+    }
 
     /// Creates an gluon type which maps to `Self` in rust
     fn make_type(vm: &Thread) -> ArcType {
@@ -302,13 +387,13 @@ pub trait AsyncPushable<'vm> {
     ///
     /// If the value must be computed asynchronously `Async::NotReady` must be returned so that
     /// the virtual machine knows it must do more work before the value is available.
-    fn async_push(self, vm: &'vm Thread, context: &mut Context) -> Result<Async<()>>;
+    fn async_push(self, vm: &'vm Thread, context: &mut Context, lock: Lock) -> Result<Async<()>>;
 
-    fn status_push(self, vm: &'vm Thread, context: &mut Context) -> Status
+    fn async_status_push(self, vm: &'vm Thread, context: &mut Context, lock: Lock) -> Status
     where
         Self: Sized,
     {
-        match self.async_push(vm, context) {
+        match self.async_push(vm, context, lock) {
             Ok(Async::Ready(())) => Status::Ok,
             Ok(Async::NotReady) => Status::Yield,
             Err(err) => {
@@ -317,7 +402,7 @@ pub trait AsyncPushable<'vm> {
                         context.alloc_ignore_limit(format!("{}", err).as_bytes()),
                     )
                 };
-                context.stack.push(Value::String(msg));
+                context.stack.push(ValueRepr::String(msg));
                 Status::Error
             }
         }
@@ -328,7 +413,8 @@ impl<'vm, T> AsyncPushable<'vm> for T
 where
     T: Pushable<'vm>,
 {
-    fn async_push(self, vm: &'vm Thread, context: &mut Context) -> Result<Async<()>> {
+    fn async_push(self, vm: &'vm Thread, context: &mut Context, lock: Lock) -> Result<Async<()>> {
+        context.stack.release_lock(lock);
         self.push(vm, context).map(Async::Ready)
     }
 }
@@ -339,30 +425,80 @@ pub trait Pushable<'vm>: AsyncPushable<'vm> {
     /// to the stack and `Ok(())` should be returned. If the call is unsuccessful `Status:Error`
     /// should be returned and the stack should be left intact
     fn push(self, vm: &'vm Thread, context: &mut Context) -> Result<()>;
+
+    fn status_push(self, vm: &'vm Thread, context: &mut Context) -> Status
+    where
+        Self: Sized,
+    {
+        match self.push(vm, context) {
+            Ok(()) => Status::Ok,
+            Err(err) => {
+                let msg = unsafe {
+                    GcStr::from_utf8_unchecked(
+                        context.alloc_ignore_limit(format!("{}", err).as_bytes()),
+                    )
+                };
+                context.stack.push(ValueRepr::String(msg));
+                Status::Error
+            }
+        }
+    }
+
+    unsafe fn marshal_unrooted(self, vm: &'vm Thread) -> Result<Value>
+    where
+        Self: Sized,
+    {
+        let mut context = vm.context();
+        self.push(vm, &mut context)?;
+        Ok(context.stack.pop())
+    }
+
+    fn marshal<T>(self, vm: &'vm Thread) -> Result<RootedValue<T>>
+    where
+        Self: Sized,
+        T: VmRoot<'vm>,
+    {
+        let mut context = vm.context();
+        self.push(vm, &mut context)?;
+        Ok(vm.root_value(context.stack.pop()))
+    }
 }
 
 /// Trait which allows rust values to be retrieved from the virtual machine
 pub trait Getable<'vm>: Sized {
     /// unsafe version of from_value which allows references to the internal of GcPtr's to be
     /// extracted if `value` is rooted
-    unsafe fn from_value_unsafe(vm: &'vm Thread, value: Variants) -> Option<Self> {
+    unsafe fn from_value_unsafe(vm: &'vm Thread, value: Variants) -> Self {
         Self::from_value(vm, value)
     }
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<Self>;
+    fn from_value(vm: &'vm Thread, value: Variants) -> Self;
+}
+
+pub fn convert<'vm, T, U>(thread: &'vm Thread, t: T) -> Result<U>
+where
+    T: Pushable<'vm>,
+    U: Getable<'vm>,
+{
+    let mut context = thread.context();
+    t.push(thread, &mut context)?;
+    unsafe {
+        let value = context.stack.pop();
+        Ok(U::from_value(thread, Variants::new(&value)))
+    }
 }
 
 impl<'vm, T: vm::Userdata> Pushable<'vm> for T {
     fn push(self, thread: &'vm Thread, context: &mut Context) -> Result<()> {
         let data: Box<vm::Userdata> = Box::new(self);
         let userdata = context.alloc_with(thread, Move(data))?;
-        context.stack.push(Value::Userdata(userdata));
+        context.stack.push(ValueRepr::Userdata(userdata));
         Ok(())
     }
 }
 
 impl<'vm> Getable<'vm> for Value {
-    fn from_value(_vm: &'vm Thread, value: Variants) -> Option<Self> {
-        Some(value.0)
+    fn from_value(_vm: &'vm Thread, value: Variants) -> Self {
+        value.get_value()
     }
 }
 
@@ -377,21 +513,22 @@ impl<'vm, T> Getable<'vm> for &'vm T
 where
     T: vm::Userdata,
 {
-    unsafe fn from_value_unsafe(vm: &'vm Thread, value: Variants) -> Option<Self> {
-        <*const T as Getable<'vm>>::from_value(vm, value).map(|p| &*p)
+    unsafe fn from_value_unsafe(vm: &'vm Thread, value: Variants) -> Self {
+        let v = <*const T as Getable<'vm>>::from_value(vm, value);
+        &*v
     }
     // Only allow the unsafe version to be used
-    fn from_value(_vm: &'vm Thread, _value: Variants) -> Option<Self> {
-        None
+    fn from_value(_vm: &'vm Thread, _value: Variants) -> Self {
+        ice!("Getable::from_value usage")
     }
 }
 
 impl<'vm> Getable<'vm> for &'vm str {
-    fn from_value(_vm: &'vm Thread, value: Variants) -> Option<Self> {
+    fn from_value(_vm: &'vm Thread, value: Variants) -> Self {
         unsafe {
             match value.as_ref() {
-                ValueRef::String(ref s) => Some(forget_lifetime(s)),
-                _ => None,
+                ValueRef::String(ref s) => forget_lifetime(s),
+                _ => ice!("ValueRef is not a String"),
             }
         }
     }
@@ -431,12 +568,14 @@ impl<'vm, T> Getable<'vm> for WithVM<'vm, T>
 where
     T: Getable<'vm>,
 {
-    unsafe fn from_value_unsafe(vm: &'vm Thread, value: Variants) -> Option<WithVM<'vm, T>> {
-        T::from_value_unsafe(vm, value).map(|t| WithVM { vm: vm, value: t })
+    unsafe fn from_value_unsafe(vm: &'vm Thread, value: Variants) -> WithVM<'vm, T> {
+        let t = T::from_value_unsafe(vm, value);
+        WithVM { vm, value: t }
     }
 
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<WithVM<'vm, T>> {
-        T::from_value(vm, value).map(|t| WithVM { vm: vm, value: t })
+    fn from_value(vm: &'vm Thread, value: Variants) -> WithVM<'vm, T> {
+        let t = T::from_value(vm, value);
+        WithVM { vm, value: t }
     }
 }
 
@@ -445,13 +584,13 @@ impl VmType for () {
 }
 impl<'vm> Pushable<'vm> for () {
     fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-        context.stack.push(Value::Int(0));
+        context.stack.push(ValueRepr::Int(0));
         Ok(())
     }
 }
 impl<'vm> Getable<'vm> for () {
-    fn from_value(_: &'vm Thread, _: Variants) -> Option<()> {
-        Some(())
+    fn from_value(_: &'vm Thread, _: Variants) -> () {
+        ()
     }
 }
 
@@ -460,15 +599,15 @@ impl VmType for u8 {
 }
 impl<'vm> Pushable<'vm> for u8 {
     fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-        context.stack.push(Value::Byte(self));
+        context.stack.push(ValueRepr::Byte(self));
         Ok(())
     }
 }
 impl<'vm> Getable<'vm> for u8 {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<u8> {
+    fn from_value(_: &'vm Thread, value: Variants) -> u8 {
         match value.as_ref() {
-            ValueRef::Byte(i) => Some(i),
-            _ => None,
+            ValueRef::Byte(i) => i,
+            _ => ice!("ValueRef is not a Byte"),
         }
     }
 }
@@ -481,15 +620,15 @@ macro_rules! int_impls {
         }
         impl<'vm> Pushable<'vm> for $id {
             fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-                context.stack.push(Value::Int(self as VmInt));
+                context.stack.push(ValueRepr::Int(self as VmInt));
                 Ok(())
             }
         }
         impl<'vm> Getable<'vm> for $id {
-            fn from_value(_: &'vm Thread, value: Variants) -> Option<Self> {
+            fn from_value(_: &'vm Thread, value: Variants) -> Self {
                 match value.as_ref() {
-                    ValueRef::Int(i) => Some(i as $id),
-                    _ => None,
+                    ValueRef::Int(i) => i as $id,
+                    _ => ice!("expected ValueRef to be an Int, got {:?}", value.as_ref()),
                 }
             }
         }
@@ -504,15 +643,15 @@ impl VmType for f64 {
 }
 impl<'vm> Pushable<'vm> for f64 {
     fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-        context.stack.push(Value::Float(self));
+        context.stack.push(ValueRepr::Float(self));
         Ok(())
     }
 }
 impl<'vm> Getable<'vm> for f64 {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<f64> {
+    fn from_value(_: &'vm Thread, value: Variants) -> f64 {
         match value.as_ref() {
-            ValueRef::Float(f) => Some(f),
-            _ => None,
+            ValueRef::Float(f) => f,
+            _ => ice!("ValueRef is not a Float"),
         }
     }
 }
@@ -520,24 +659,24 @@ impl VmType for bool {
     type Type = Self;
     fn make_type(vm: &Thread) -> ArcType {
         (*vm.global_env()
-             .get_env()
-             .find_type_info("std.types.Bool")
-             .unwrap())
+            .get_env()
+            .find_type_info("std.types.Bool")
+            .unwrap())
             .clone()
             .into_type()
     }
 }
 impl<'vm> Pushable<'vm> for bool {
     fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-        context.stack.push(Value::Tag(if self { 1 } else { 0 }));
+        context.stack.push(ValueRepr::Tag(if self { 1 } else { 0 }));
         Ok(())
     }
 }
 impl<'vm> Getable<'vm> for bool {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<bool> {
+    fn from_value(_: &'vm Thread, value: Variants) -> bool {
         match value.as_ref() {
-            ValueRef::Data(data) => Some(data.tag() == 1),
-            _ => None,
+            ValueRef::Data(data) => data.tag() == 1,
+            _ => ice!("ValueRef is not a Bool"),
         }
     }
 }
@@ -558,21 +697,21 @@ impl<'vm> Pushable<'vm> for Ordering {
             Ordering::Equal => 1,
             Ordering::Greater => 2,
         };
-        context.stack.push(Value::Tag(tag));
+        context.stack.push(ValueRepr::Tag(tag));
         Ok(())
     }
 }
 impl<'vm> Getable<'vm> for Ordering {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<Ordering> {
+    fn from_value(_: &'vm Thread, value: Variants) -> Ordering {
         let tag = match value.as_ref() {
             ValueRef::Data(data) => data.tag(),
-            _ => return None,
+            _ => ice!("ValueRef is not an Ordering"),
         };
         match tag {
-            0 => Some(Ordering::Less),
-            1 => Some(Ordering::Equal),
-            2 => Some(Ordering::Greater),
-            _ => None,
+            0 => Ordering::Less,
+            1 => Ordering::Equal,
+            2 => Ordering::Greater,
+            _ => ice!("Ordering has a wrong tag: {}", tag),
         }
     }
 }
@@ -591,15 +730,15 @@ impl<'vm, 's> Pushable<'vm> for &'s String {
 impl<'vm, 's> Pushable<'vm> for &'s str {
     fn push(self, thread: &'vm Thread, context: &mut Context) -> Result<()> {
         let s = unsafe { GcStr::from_utf8_unchecked(context.alloc_with(thread, self.as_bytes())?) };
-        context.stack.push(Value::String(s));
+        context.stack.push(ValueRepr::String(s));
         Ok(())
     }
 }
 impl<'vm> Getable<'vm> for String {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<String> {
+    fn from_value(_: &'vm Thread, value: Variants) -> String {
         match value.as_ref() {
-            ValueRef::String(i) => Some(String::from(&i[..])),
-            _ => None,
+            ValueRef::String(i) => String::from(&i[..]),
+            _ => ice!("ValueRef is not a String"),
         }
     }
 }
@@ -614,15 +753,21 @@ impl VmType for char {
 }
 impl<'vm> Pushable<'vm> for char {
     fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-        context.stack.push(Value::Int(self as VmInt));
+        context.stack.push(ValueRepr::Int(self as VmInt));
         Ok(())
     }
 }
 impl<'vm> Getable<'vm> for char {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<char> {
+    fn from_value(_: &'vm Thread, value: Variants) -> char {
         match value.as_ref() {
-            ValueRef::Int(x) => ::std::char::from_u32(x as u32),
-            _ => None,
+            ValueRef::Int(x) => match ::std::char::from_u32(x as u32) {
+                Some(ch) => ch,
+                None => ice!("Failed conversion from Int to char for: {}", x),
+            },
+            _ => ice!(
+                "expected ValueRef to be an Int (char), got {:?}",
+                value.as_ref()
+            ),
         }
     }
 }
@@ -662,20 +807,23 @@ where
 {
     fn push(self, thread: &'vm Thread, context: &mut Context) -> Result<()> {
         let result = context.alloc_with(thread, self)?;
-        context.stack.push(Value::Array(result));
+        context.stack.push(ValueRepr::Array(result));
         Ok(())
     }
 }
 impl<'s, 'vm, T: Copy + ArrayRepr> Getable<'vm> for &'s [T] {
-    unsafe fn from_value_unsafe(_: &'vm Thread, value: Variants) -> Option<Self> {
+    unsafe fn from_value_unsafe(_: &'vm Thread, value: Variants) -> Self {
         match value.as_ref() {
-            ValueRef::Array(ptr) => ptr.0.as_slice().map(|s| &*(s as *const _)),
-            _ => None,
+            ValueRef::Array(ptr) => {
+                let s = ptr.0.as_slice().unwrap();
+                &*(s as *const _)
+            }
+            _ => ice!("ValueRef is not an Array"),
         }
     }
     // Only allow the unsafe version to be used
-    fn from_value(_vm: &'vm Thread, _value: Variants) -> Option<Self> {
-        None
+    fn from_value(_vm: &'vm Thread, _value: Variants) -> Self {
+        ice!("Getable::from_value usage")
     }
 }
 
@@ -709,17 +857,12 @@ where
                 ..
             } = *context;
             let values = &stack[stack.len() - len..];
-            thread::alloc(
-                gc,
-                thread,
-                stack,
-                ArrayDef(values)
-            )?
+            thread::alloc(gc, thread, stack, ArrayDef(values))?
         };
         for _ in 0..len {
             context.stack.pop();
         }
-        context.stack.push(Value::Array(result));
+        context.stack.push(ValueRepr::Array(result));
         Ok(())
     }
 }
@@ -732,10 +875,13 @@ impl<'s, T: VmType> VmType for *const T {
 }
 
 impl<'vm, T: vm::Userdata> Getable<'vm> for *const T {
-    fn from_value(_: &'vm Thread, value: Variants) -> Option<*const T> {
+    fn from_value(_: &'vm Thread, value: Variants) -> *const T {
         match value.as_ref() {
-            ValueRef::Userdata(data) => data.downcast_ref::<T>().map(|x| x as *const T),
-            _ => None,
+            ValueRef::Userdata(data) => {
+                let x = data.downcast_ref::<T>().unwrap();
+                x as *const T
+            }
+            _ => ice!("ValueRef is not an Userdata"),
         }
     }
 }
@@ -764,22 +910,20 @@ impl<'vm, T: Pushable<'vm>> Pushable<'vm> for Option<T> {
                 assert!(context.stack.len() == len);
                 context.stack.push(value);
             }
-            None => context.stack.push(Value::Tag(0)),
+            None => context.stack.push(ValueRepr::Tag(0)),
         }
         Ok(())
     }
 }
 impl<'vm, T: Getable<'vm>> Getable<'vm> for Option<T> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<Option<T>> {
+    fn from_value(vm: &'vm Thread, value: Variants) -> Option<T> {
         match value.as_ref() {
-            ValueRef::Data(data) => {
-                if data.tag() == 0 {
-                    Some(None)
-                } else {
-                    T::from_value(vm, data.get_variants(0).unwrap()).map(Some)
-                }
-            }
-            _ => None,
+            ValueRef::Data(data) => if data.tag() == 0 {
+                None
+            } else {
+                Some(T::from_value(vm, data.get_variant(0).unwrap()))
+            },
+            _ => ice!("ValueRef is not an Option"),
         }
     }
 }
@@ -819,22 +963,20 @@ impl<'vm, T: Pushable<'vm>, E: Pushable<'vm>> Pushable<'vm> for StdResult<T, E> 
                 elems: &[value],
             },
         )?;
-        context.stack.push(Value::Data(data));
+        context.stack.push(ValueRepr::Data(data));
         Ok(())
     }
 }
 
 impl<'vm, T: Getable<'vm>, E: Getable<'vm>> Getable<'vm> for StdResult<T, E> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<StdResult<T, E>> {
+    fn from_value(vm: &'vm Thread, value: Variants) -> StdResult<T, E> {
         match value.as_ref() {
-            ValueRef::Data(data) => {
-                match data.tag() {
-                    0 => E::from_value(vm, data.get_variants(0).unwrap()).map(Err),
-                    1 => T::from_value(vm, data.get_variants(0).unwrap()).map(Ok),
-                    _ => None,
-                }
-            }
-            _ => None,
+            ValueRef::Data(data) => match data.tag() {
+                0 => Err(E::from_value(vm, data.get_variant(0).unwrap())),
+                1 => Ok(T::from_value(vm, data.get_variant(0).unwrap())),
+                _ => ice!("ValueRef has a wrong tag: {}", data.tag()),
+            },
+            _ => ice!("ValueRef is not a StdResult"),
         }
     }
 }
@@ -842,6 +984,17 @@ impl<'vm, T: Getable<'vm>, E: Getable<'vm>> Getable<'vm> for StdResult<T, E> {
 /// Wrapper around a `Future` which can be used as a return value to let the virtual machine know
 /// that it must resolve the `Future` to receive the value.
 pub struct FutureResult<F>(pub F);
+
+impl<F> FutureResult<F> {
+    #[inline]
+    pub fn new<'vm>(f: F) -> Self
+    where
+        F: Future<Error = Error> + Send + 'static,
+        F::Item: Pushable<'vm>,
+    {
+        FutureResult(f)
+    }
+}
 
 impl<F> VmType for FutureResult<F>
 where
@@ -862,11 +1015,55 @@ where
     F: Future<Error = Error> + Send + 'static,
     F::Item: Pushable<'vm>,
 {
-    fn async_push(self, _: &'vm Thread, context: &mut Context) -> Result<Async<()>> {
+    fn async_push(self, _: &'vm Thread, context: &mut Context, lock: Lock) -> Result<Async<()>> {
         unsafe {
-            context.return_future(self.0);
+            context.return_future(self.0, lock);
         }
         Ok(Async::Ready(()))
+    }
+}
+
+pub type PrimitiveFuture<T> = FutureValue<Box<Future<Item = T, Error = Error> + Send>>;
+
+impl<F> VmType for FutureValue<F>
+where
+    F: Future,
+    F::Item: VmType,
+{
+    type Type = <F::Item as VmType>::Type;
+    fn make_type(vm: &Thread) -> ArcType {
+        <F::Item>::make_type(vm)
+    }
+    fn extra_args() -> VmIndex {
+        <F::Item>::extra_args()
+    }
+}
+
+impl<'vm, F> AsyncPushable<'vm> for FutureValue<F>
+where
+    F: Future<Error = Error> + Send + 'static,
+    F::Item: Pushable<'vm>,
+{
+    fn async_push(
+        self,
+        thread: &'vm Thread,
+        context: &mut Context,
+        lock: Lock,
+    ) -> Result<Async<()>> {
+        match self {
+            FutureValue::Value(result) => {
+                context.stack.release_lock(lock);
+                let value = result?;
+                value.push(thread, context).map(Async::Ready)
+            }
+            FutureValue::Future(future) => {
+                unsafe {
+                    context.return_future(future, lock);
+                }
+                Ok(Async::Ready(()))
+            }
+            FutureValue::Polled => ice!("Tried to push a polled future to gluon"),
+        }
     }
 }
 
@@ -916,8 +1113,8 @@ where
 }
 
 impl<'vm, T: Getable<'vm>> Getable<'vm> for IO<T> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<IO<T>> {
-        T::from_value(vm, value).map(IO::Value)
+    fn from_value(vm: &'vm Thread, value: Variants) -> IO<T> {
+        IO::Value(T::from_value(vm, value))
     }
 }
 
@@ -937,6 +1134,17 @@ impl<'vm, T: Pushable<'vm>> Pushable<'vm> for IO<T> {
 pub struct OpaqueValue<T, V>(RootedValue<T>, PhantomData<V>)
 where
     T: Deref<Target = Thread>;
+
+#[cfg(feature = "serde")]
+impl<'de, V> Deserialize<'de> for OpaqueValue<RootedThread, V> {
+    fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = self::de::deserialize_raw_value(deserializer)?;
+        Ok(Self::from_value(value))
+    }
+}
 
 impl<T, V> fmt::Debug for OpaqueValue<T, V>
 where
@@ -960,6 +1168,10 @@ impl<T, V> OpaqueValue<T, V>
 where
     T: Deref<Target = Thread>,
 {
+    pub fn from_value(value: RootedValue<T>) -> Self {
+        OpaqueValue(value, PhantomData)
+    }
+
     pub fn vm(&self) -> &Thread {
         self.0.vm()
     }
@@ -970,15 +1182,15 @@ where
 
     /// Unsafe as `Value` are not rooted
     pub unsafe fn get_value(&self) -> Value {
-        *self.0
+        self.0.get_value()
     }
 
-    pub fn get_variants(&self) -> Variants {
-        unsafe { Variants::new(&self.0) }
+    pub fn get_variant(&self) -> Variants {
+        self.0.get_variant()
     }
 
     pub fn get_ref(&self) -> ValueRef {
-        ValueRef::new(&self.0)
+        self.0.get_variant().as_ref()
     }
 }
 
@@ -991,6 +1203,10 @@ where
     type Type = V::Type;
     fn make_type(vm: &Thread) -> ArcType {
         V::make_type(vm)
+    }
+
+    fn extra_args() -> VmIndex {
+        V::extra_args()
     }
 }
 
@@ -1006,20 +1222,20 @@ where
         if full_clone {
             cloner.force_full_clone();
         }
-        context.stack.push(cloner.deep_clone(*self.0)?);
+        context.stack.push(cloner.deep_clone(&self.0.get_value())?);
         Ok(())
     }
 }
 
 impl<'vm, V> Getable<'vm> for OpaqueValue<&'vm Thread, V> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<OpaqueValue<&'vm Thread, V>> {
-        Some(OpaqueValue(vm.root_value(value.0), PhantomData))
+    fn from_value(vm: &'vm Thread, value: Variants) -> OpaqueValue<&'vm Thread, V> {
+        OpaqueValue::from_value(vm.root_value(value.get_value()))
     }
 }
 
 impl<'vm, V> Getable<'vm> for OpaqueValue<RootedThread, V> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<OpaqueValue<RootedThread, V>> {
-        Some(OpaqueValue(vm.root_value(value.0), PhantomData))
+    fn from_value(vm: &'vm Thread, value: Variants) -> OpaqueValue<RootedThread, V> {
+        OpaqueValue::from_value(vm.root_value(value.get_value()))
     }
 }
 
@@ -1029,7 +1245,7 @@ pub struct ArrayRef<'vm>(&'vm ValueArray);
 impl<'vm> ArrayRef<'vm> {
     pub fn get(&self, index: usize) -> Option<Variants> {
         if index < self.0.len() {
-            unsafe { Some(Variants::with_root(self.0.get(index), self)) }
+            Some(self.0.get(index))
         } else {
             None
         }
@@ -1042,8 +1258,8 @@ impl<'vm> ArrayRef<'vm> {
         self.0.as_slice()
     }
 
-    pub fn iter(&self) -> ::value::VariantIter<'vm> {
-        self.0.variant_iter()
+    pub fn iter(&self) -> ::value::Iter<'vm> {
+        self.0.iter()
     }
 }
 
@@ -1061,23 +1277,21 @@ impl<'vm, T> Array<'vm, T> {
 
     #[doc(hidden)]
     pub fn get_value_array(&self) -> &ValueArray {
-        match *self.0 {
-            Value::Array(ref array) => array,
-            _ => panic!("Expected an array found {:?}", self.0),
+        match self.0.get_variant().as_ref() {
+            ValueRef::Array(ref array) => &array.0,
+            _ => ice!("Expected an array found {:?}", self.0),
         }
     }
 }
 
 impl<'vm, T: for<'vm2> Getable<'vm2>> Array<'vm, T> {
     pub fn get(&self, index: VmInt) -> Option<T> {
-        unsafe {
-            match Variants::new(&self.0).as_ref() {
-                ValueRef::Array(data) => {
-                    let v = data.get(index as usize).unwrap();
-                    T::from_value(self.0.vm(), v)
-                }
-                _ => None,
+        match self.0.get_variant().as_ref() {
+            ValueRef::Array(data) => {
+                let v = data.get(index as usize).unwrap();
+                Some(T::from_value(self.0.vm(), v))
             }
+            _ => None,
         }
     }
 }
@@ -1092,20 +1306,19 @@ where
     }
 }
 
-
 impl<'vm, T: VmType> Pushable<'vm> for Array<'vm, T>
 where
     T::Type: Sized,
 {
     fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-        context.stack.push(*self.0);
+        context.stack.push(self.0.get_variant());
         Ok(())
     }
 }
 
 impl<'vm, T> Getable<'vm> for Array<'vm, T> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<Array<'vm, T>> {
-        Some(Array(vm.root_value(value.0), PhantomData))
+    fn from_value(vm: &'vm Thread, value: Variants) -> Array<'vm, T> {
+        Array(vm.root_value(value.get_value()), PhantomData)
     }
 }
 
@@ -1113,10 +1326,10 @@ impl<'vm, T: Any> VmType for Root<'vm, T> {
     type Type = T;
 }
 impl<'vm, T: vm::Userdata> Getable<'vm> for Root<'vm, T> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<Root<'vm, T>> {
+    fn from_value(vm: &'vm Thread, value: Variants) -> Root<'vm, T> {
         match value.0 {
-            Value::Userdata(data) => vm.root::<T>(data).map(From::from),
-            _ => None,
+            ValueRepr::Userdata(data) => From::from(vm.root::<T>(data).unwrap()),
+            _ => ice!("Value is not a Root"),
         }
     }
 }
@@ -1125,10 +1338,10 @@ impl<'vm> VmType for RootStr<'vm> {
     type Type = <str as VmType>::Type;
 }
 impl<'vm> Getable<'vm> for RootStr<'vm> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<RootStr<'vm>> {
+    fn from_value(vm: &'vm Thread, value: Variants) -> RootStr<'vm> {
         match value.0 {
-            Value::String(v) => Some(vm.root_string(v)),
-            _ => None,
+            ValueRepr::String(v) => vm.root_string(v),
+            _ => ice!("Value is not a String"),
         }
     }
 }
@@ -1176,30 +1389,31 @@ macro_rules! define_tuple {
 
             fn make_type(vm: &Thread) -> ArcType {
                 let type_cache = vm.global_env().type_cache();
-                type_cache.record(Vec::new(),
-                             vec![$(types::Field::new(Symbol::from(stringify!($id)),
-                                                      $id::make_type(vm))),+])
+                type_cache.tuple(
+                    &mut Symbols::new(),
+                    vec![$( $id::make_type(vm) ),+]
+                )
             }
         }
+
+        #[allow(non_snake_case)]
         impl<'vm, $($id: Getable<'vm>),+> Getable<'vm> for ($($id),+) {
             #[allow(unused_assignments)]
-            fn from_value(vm: &'vm Thread, value: Variants) -> Option<($($id),+)> {
+            fn from_value(vm: &'vm Thread, value: Variants) -> ($($id),+) {
                 match value.as_ref() {
                     ValueRef::Data(v) => {
                         assert!(v.len() == count!($($id),+));
                         let mut i = 0;
-                        let x = ( $(
-                            { let a = $id::from_value(vm, v.get_variants(i).unwrap()); i += 1; a }
-                        ),+ );
-                        match x {
-                            ($(Some($id)),+) => Some(( $($id),+ )),
-                            _ => None,
-                        }
+                        ( $(
+                            { let a = $id::from_value(vm, v.get_variant(i).unwrap()); i += 1; a }
+                        ),+ )
                     }
-                    _ => None,
+                    _ => ice!("ValueRef is not a Tuple"),
                 }
             }
         }
+
+        #[allow(non_snake_case)]
         impl<'vm, $($id),+> Pushable<'vm> for ($($id),+)
         where $($id: Pushable<'vm>),+
         {
@@ -1220,7 +1434,7 @@ macro_rules! define_tuple {
                 for _ in 0..len {
                     context.stack.pop();
                 }
-                context.stack.push(Value::Data(value)) ;
+                context.stack.push(ValueRepr::Data(value)) ;
                 Ok(())
             }
         }
@@ -1234,8 +1448,7 @@ macro_rules! define_tuples {
         define_tuples!{ $($rest)+ }
     }
 }
-define_tuples! { _0 _1 _2 _3 _4 _5 _6 }
-
+define_tuples! { A B C D E F G H I J K L }
 
 pub use self::record::Record;
 
@@ -1252,7 +1465,7 @@ pub mod record {
     use thread::{self, Context, ThreadInternal};
     use types::VmIndex;
     use vm::Thread;
-    use value::{Def, Value};
+    use value::{Def, Value, ValueRepr};
     use super::{Getable, Pushable, VmType};
 
     pub struct Record<T> {
@@ -1325,9 +1538,7 @@ pub mod record {
     {
         fn from_value(vm: &'vm Thread, values: &[Value]) -> Option<Self> {
             let head = unsafe { H::from_value(vm, Variants::new(&values[0])) };
-            head.and_then(|head| {
-                T::from_value(vm, &values[1..]).map(move |tail| h_cons((F::default(), head), tail))
-            })
+            T::from_value(vm, &values[1..]).map(move |tail| h_cons((F::default(), head), tail))
         }
     }
 
@@ -1361,7 +1572,7 @@ pub mod record {
             for _ in 0..len {
                 context.stack.pop();
             }
-            context.stack.push(Value::Data(value));
+            context.stack.push(ValueRepr::Data(value));
             Ok(())
         }
     }
@@ -1369,12 +1580,13 @@ pub mod record {
     where
         T: GetableFieldList<'vm>,
     {
-        fn from_value(vm: &'vm Thread, value: Variants) -> Option<Self> {
+        fn from_value(vm: &'vm Thread, value: Variants) -> Self {
             match value.0 {
-                Value::Data(ref data) => {
-                    T::from_value(vm, &data.fields).map(|fields| Record { fields: fields })
+                ValueRepr::Data(ref data) => {
+                    let fields = T::from_value(vm, &data.fields).unwrap();
+                    Record { fields }
                 }
-                _ => None,
+                _ => ice!("Value is not a Record"),
             }
         }
     }
@@ -1394,7 +1606,7 @@ where
     fn push(self, thread: &'vm Thread, context: &mut Context) -> Result<()> {
         // Map rust modules into gluon modules
         let id = Symbol::from(self.name.replace("::", "."));
-        let value = Value::Function(context.alloc_with(
+        let value = ValueRepr::Function(context.alloc_with(
             thread,
             Move(ExternFunction {
                 id: id,
@@ -1413,7 +1625,6 @@ impl<'vm, F: VmType> VmType for RefPrimitive<'vm, F> {
         F::make_type(vm)
     }
 }
-
 
 impl<'vm, F> Pushable<'vm> for RefPrimitive<'vm, F>
 where
@@ -1471,11 +1682,10 @@ impl<'vm> Pushable<'vm> for CPrimitive {
                 function: extern_function,
             }),
         )?;
-        context.stack.push(Value::Function(value));
+        context.stack.push(ValueRepr::Function(value));
         Ok(())
     }
 }
-
 
 fn make_type<T: ?Sized + VmType>(vm: &Thread) -> ArcType {
     <T as VmType>::make_type(vm)
@@ -1483,6 +1693,7 @@ fn make_type<T: ?Sized + VmType>(vm: &Thread) -> ArcType {
 
 /// Type which represents a function reference in gluon
 pub type FunctionRef<'vm, F> = Function<&'vm Thread, F>;
+pub type OwnedFunction<F> = Function<RootedThread, F>;
 
 /// Type which represents an function in gluon
 pub struct Function<T, F>
@@ -1491,6 +1702,33 @@ where
 {
     value: RootedValue<T>,
     _marker: PhantomData<F>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de, V> Deserialize<'de> for Function<RootedThread, V> {
+    fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = self::de::deserialize_raw_value(deserializer)?;
+        Ok(Function {
+            value,
+            _marker: PhantomData,
+        })
+    }
+}
+
+impl<T, F> Function<T, F>
+where
+    T: Deref<Target = Thread>,
+{
+    pub fn get_variant(&self) -> Variants {
+        self.value.get_variant()
+    }
+
+    pub fn vm(&self) -> &Thread {
+        self.value.vm()
+    }
 }
 
 impl<T, F> Clone for Function<T, F>
@@ -1502,15 +1740,6 @@ where
             value: self.value.clone(),
             _marker: self._marker.clone(),
         }
-    }
-}
-
-impl<T, F> Function<T, F>
-where
-    T: Deref<Target = Thread>,
-{
-    pub fn value(&self) -> Value {
-        *self.value
     }
 }
 
@@ -1531,26 +1760,26 @@ where
     F: VmType,
 {
     fn push(self, _: &'vm Thread, context: &mut Context) -> Result<()> {
-        context.stack.push(*self.value);
+        context.stack.push(self.value.get_variant());
         Ok(())
     }
 }
 
 impl<'vm, F> Getable<'vm> for Function<&'vm Thread, F> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<Function<&'vm Thread, F>> {
-        Some(Function {
-            value: vm.root_value(value.0),
+    fn from_value(vm: &'vm Thread, value: Variants) -> Function<&'vm Thread, F> {
+        Function {
+            value: vm.root_value(value.get_value()),
             _marker: PhantomData,
-        }) //TODO not type safe
+        } //TODO not type safe
     }
 }
 
 impl<'vm, F> Getable<'vm> for Function<RootedThread, F> {
-    fn from_value(vm: &'vm Thread, value: Variants) -> Option<Self> {
-        Some(Function {
-            value: vm.root_value(value.0),
+    fn from_value(vm: &'vm Thread, value: Variants) -> Self {
+        Function {
+            value: vm.root_value(value.get_value()),
             _marker: PhantomData,
-        }) //TODO not type safe
+        } //TODO not type safe
     }
 }
 
@@ -1604,6 +1833,7 @@ macro_rules! make_vm_function {
 impl <$($args: VmType,)* R: VmType> VmType for fn ($($args),*) -> R {
     #[allow(non_snake_case)]
     type Type = fn ($($args::Type),*) -> R::Type;
+
     #[allow(non_snake_case)]
     fn make_type(vm: &Thread) -> ArcType {
         let args = vec![$(make_type::<$args>(vm)),*];
@@ -1626,26 +1856,26 @@ where $($args: Getable<'vm> + 'vm,)*
         let n_args = Self::arguments();
         let mut context = vm.context();
         let mut i = 0;
+        let lock;
         let r = unsafe {
-            let (lock, ($($args,)*)) = {
+            let ($($args,)*) = {
                 let stack = StackFrame::current(&mut context.stack);
                 $(let $args = {
-                    let x = $args::from_value_unsafe(vm, Variants::new(&stack[i]))
-                        .expect(stringify!(Argument $args));
+                    let x = $args::from_value_unsafe(vm, Variants::new(&stack[i]));
                     i += 1;
                     x
                 });*;
 // Lock the frame to ensure that any reference from_value_unsafe may have returned stay
 // rooted
-                (stack.into_lock(), ($($args,)*))
+                lock = stack.into_lock();
+                ($($args,)*)
             };
             drop(context);
             let r = (*self)($($args),*);
             context = vm.context();
-            context.stack.release_lock(lock);
             r
         };
-        r.status_push(vm, &mut context)
+        r.async_status_push(vm, &mut context, lock)
     }
 }
 
@@ -1673,36 +1903,36 @@ where $($args: Getable<'vm> + 'vm,)*
         let n_args = Self::arguments();
         let mut context = vm.context();
         let mut i = 0;
+        let lock;
         let r = unsafe {
-            let (lock, ($($args,)*)) = {
+            let ($($args,)*) = {
                 let stack = StackFrame::current(&mut context.stack);
                 $(let $args = {
-                    let x = $args::from_value_unsafe(vm, Variants::new(&stack[i]))
-                        .expect(stringify!(Argument $args));
+                    let x = $args::from_value_unsafe(vm, Variants::new(&stack[i]));
                     i += 1;
                     x
                 });*;
 // Lock the frame to ensure that any reference from_value_unsafe may have returned stay
 // rooted
-                (stack.into_lock(), ($($args,)*))
+                lock = stack.into_lock();
+                ($($args,)*)
             };
             drop(context);
             let r = (*self)($($args),*);
             context = vm.context();
-            context.stack.release_lock(lock);
             r
         };
-        r.status_push(vm, &mut context)
+        r.async_status_push(vm, &mut context, lock)
     }
 }
 
-impl<'vm, T, $($args,)* R> Function<T, fn($($args),*) -> R>
-    where $($args: Pushable<'vm>,)*
+impl<T, $($args,)* R> Function<T, fn($($args),*) -> R>
+    where $($args: for<'vm> Pushable<'vm>,)*
           T: Deref<Target = Thread>,
           R: VmType + for<'x> Getable<'x>,
 {
     #[allow(non_snake_case)]
-    pub fn call(&'vm mut self $(, $args: $args)*) -> Result<R> {
+    pub fn call(&mut self $(, $args: $args)*) -> Result<R> {
         match self.call_first($($args),*)? {
             Async::Ready(value) => Ok(value),
             Async::NotReady => Err(Error::Message("Unexpected async".into())),
@@ -1710,10 +1940,10 @@ impl<'vm, T, $($args,)* R> Function<T, fn($($args),*) -> R>
     }
 
     #[allow(non_snake_case)]
-    fn call_first(&'vm self $(, $args: $args)*) -> Result<Async<R>> {
+    fn call_first(&self $(, $args: $args)*) -> Result<Async<R>> {
         let vm = self.value.vm();
         let mut context = vm.context();
-        context.stack.push(*self.value);
+        context.stack.push(self.value.get_variant());
         $(
             $args.push(&vm, &mut context)?;
         )*
@@ -1734,40 +1964,67 @@ impl<'vm, T, $($args,)* R> Function<T, fn($($args),*) -> R>
 
     fn return_value(vm: &Thread, value: Value) -> Result<R> {
         unsafe {
-            R::from_value(vm, Variants::new(&value))
-                .ok_or_else(|| {
-                    error!("Wrong type {:?}", value);
-                    Error::Message("Wrong type".to_string())
-                })
+            Ok(R::from_value(vm, Variants::new(&value)))
         }
     }
 }
 
-impl<'vm, T, $($args,)* R> Function<T, fn($($args),*) -> R>
-    where $($args: Pushable<'vm>,)*
-          T: Deref<Target = Thread> + Clone + Send + 'static,
-          R: VmType + for<'x> Getable<'x> + Send + 'static,
+impl<T, $($args,)* R> Function<T, fn($($args),*) -> R>
+    where $($args: for<'vm> Pushable<'vm>,)*
+          T: Deref<Target = Thread> + Clone + Send,
+          R: VmType + for<'x> Getable<'x> + Send + Sync + 'static,
 {
     #[allow(non_snake_case)]
-    pub fn call_async(&'vm mut self $(, $args: $args)*) -> Box<Future<Item = R, Error = Error> + Send + 'static> {
-        use futures::{failed, finished};
-        use futures::future::Either;
+    pub fn call_async(
+        &mut self
+        $(, $args: $args)*
+        ) -> Box<Future<Item = R, Error = Error> + Send + Sync + 'static>
+    {
         use thread::Execute;
+        use futures::IntoFuture;
 
-        Box::new(match self.call_first($($args),*) {
+        match self.call_first($($args),*) {
             Ok(ok) => {
-                Either::A(match ok {
-                    Async::Ready(value) => Either::A(finished(value)),
+                match ok {
+                    Async::Ready(value) => Box::new(Ok(value).into_future()),
                     Async::NotReady => {
-                        Either::B(Execute::new(self.value.clone_vm())
-                            .and_then(|(vm, value)| Self::return_value(&vm, value)))
+                        Box::new(
+                            Execute::new(self.value.vm().root_thread())
+                                .and_then(|(vm, value)| Self::return_value(&vm, value))
+                        )
                     }
-                })
+                }
             }
             Err(err) => {
-                Either::B(failed(err))
+                Box::new(Err(err).into_future())
             }
-        })
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn call_fast_async(
+        &mut self
+        $(, $args: $args)*
+        ) -> FutureValue<Box<Future<Item = R, Error = Error> + Send + Sync + 'static>>
+    {
+        use thread::Execute;
+
+        match self.call_first($($args),*) {
+            Ok(ok) => {
+                match ok {
+                    Async::Ready(value) => FutureValue::Value(Ok(value)),
+                    Async::NotReady => {
+                        FutureValue::Future(Box::new(
+                            Execute::new(self.value.vm().root_thread())
+                                .and_then(|(vm, value)| Self::return_value(&vm, value))
+                        ))
+                    }
+                }
+            }
+            Err(err) => {
+                FutureValue::Value(Err(err))
+            }
+        }
     }
 }
     )
@@ -1781,3 +2038,55 @@ make_vm_function!(A, B, C, D);
 make_vm_function!(A, B, C, D, E);
 make_vm_function!(A, B, C, D, E, F);
 make_vm_function!(A, B, C, D, E, F, G);
+
+pub struct TypedBytecode<T> {
+    id: Symbol,
+    args: VmIndex,
+    instructions: Vec<Instruction>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> TypedBytecode<T> {
+    pub fn new(name: &str, args: VmIndex, instructions: Vec<Instruction>) -> TypedBytecode<T>
+    where
+        T: VmType,
+    {
+        TypedBytecode {
+            id: Symbol::from(name),
+            args,
+            instructions,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: VmType> VmType for TypedBytecode<T> {
+    type Type = T::Type;
+
+    fn make_type(vm: &Thread) -> ArcType {
+        T::make_type(vm)
+    }
+
+    fn make_forall_type(vm: &Thread) -> ArcType {
+        T::make_forall_type(vm)
+    }
+
+    fn extra_args() -> VmIndex {
+        T::extra_args()
+    }
+}
+
+impl<'vm, T: VmType> Pushable<'vm> for TypedBytecode<T> {
+    fn push(self, thread: &'vm Thread, context: &mut Context) -> Result<()> {
+        let mut compiled_module = CompiledModule::from(CompiledFunction::new(
+            self.args,
+            self.id,
+            T::make_forall_type(thread),
+            "".into(),
+        ));
+        compiled_module.function.instructions = self.instructions;
+        let closure = thread.global_env().new_global_thunk(compiled_module)?;
+        context.stack.push(ValueRepr::Closure(closure));
+        Ok(())
+    }
+}

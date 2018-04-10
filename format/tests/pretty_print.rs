@@ -15,7 +15,7 @@ use std::path::Path;
 use format::format_expr;
 
 fn test_format(name: &str) {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let name = Path::new(name);
     let mut contents = String::new();
@@ -24,10 +24,15 @@ fn test_format(name: &str) {
         .read_to_string(&mut contents)
         .unwrap();
 
-    let out_str = format_expr(&contents).unwrap();
+    let out_str = format_expr(&contents).unwrap_or_else(|err| panic!("{}", err));
 
     if contents != out_str {
-        let out_path = Path::new(&env::var("OUT_DIR").unwrap()).join(name.file_name().unwrap());
+        let args: Vec<_> = env::args().collect();
+        let out_path = Path::new(&args[0][..])
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("folder")
+            .join(name.file_name().unwrap());
         File::create(out_path)
             .unwrap()
             .write_all(out_str.as_bytes())
@@ -45,6 +50,11 @@ fn bool() {
 #[test]
 fn char() {
     test_format("std/char.glu");
+}
+
+#[test]
+fn function() {
+    test_format("std/function.glu");
 }
 
 #[test]
@@ -103,6 +113,16 @@ fn writer() {
 }
 
 #[test]
+fn parser() {
+    test_format("std/parser.glu");
+}
+
+#[test]
+fn random() {
+    test_format("std/random.glu");
+}
+
+#[test]
 fn repl() {
     test_format("repl/src/repl.glu");
 }
@@ -130,6 +150,13 @@ fn dont_lose_information_in_literals() {
     assert_eq!(&format_expr(expr).unwrap(), expr);
 }
 
+#[test]
+fn implicit_arg() {
+    let expr = r#"
+f ?32 ""
+"#;
+    assert_eq!(&format_expr(expr).unwrap(), expr);
+}
 
 #[test]
 fn preserve_comment_between_let_in() {
@@ -152,12 +179,11 @@ fn preserve_whitespace_in_record() {
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax = 1,
 
 
-    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbby = 2
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbby = 2,
 }
 "#;
     assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
 }
-
 
 #[test]
 fn preserve_block_comments() {
@@ -218,8 +244,8 @@ let {
 fn preserve_comments_in_function_types() {
     let expr = r#"#!/bin/gluon
 let x : /* first */ Int /* Int */ ->
-    // Float
-    Float /* last */ = ()
+        // Float
+        Float /* last */ = ()
 x
 "#;
     assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
@@ -229,8 +255,8 @@ x
 fn preserve_comments_app_types() {
     let expr = r#"#!/bin/gluon
 let x : Test /* first */ Int
-    // middle
-    Float /* last */ = ()
+        // middle
+        Float /* last */ = ()
 x
 "#;
     assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
@@ -248,6 +274,78 @@ type Test = {
     field2 : Float
 }
 x
+"#;
+    assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
+}
+
+#[test]
+fn preserve_comments_in_empty_record() {
+    let expr = r#"
+{
+// 123
+}
+"#;
+    assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
+}
+
+#[test]
+fn preserve_comments_in_record_base() {
+    let expr = r#"
+{
+    // 123
+    ..
+    // abc
+    test
+/* x */
+}
+"#;
+    assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
+}
+
+#[test]
+fn small_record_in_let() {
+    let expr = r#"
+let semigroup =
+    { append }
+()
+"#;
+    assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
+}
+
+#[test]
+fn do_expression() {
+    let expr = r#"
+do /* x1 */ x /* x2 */ = Some 1
+// test
+test abc 1232 ""
+"#;
+    assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
+}
+
+#[test]
+fn if_else_multiple() {
+    let expr = r#"
+if x
+then y
+else if z
+then w
+else 0
+"#;
+    assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
+}
+
+#[test]
+fn comments_in_block_exprs() {
+    let expr = r#"
+// test
+test 123
+
+// test1
+
+// test1
+
+abc ""
+// test2
 "#;
     assert_diff!(&format_expr(expr).unwrap(), expr, " ", 0);
 }

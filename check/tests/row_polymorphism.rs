@@ -12,33 +12,27 @@ use check::kindcheck::KindCheck;
 
 use support::{intern, typ, MockEnv, MockIdentEnv};
 
+#[macro_use]
 mod support;
 
 #[test]
 fn infer_fields() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 let f vec = vec.x #Int+ vec.y
 f
 "#;
     let result = support::typecheck(text);
-    let record = Type::record(
-        vec![],
-        vec![
-            Field::new(intern("x"), typ("Int")),
-            Field::new(intern("y"), typ("Int")),
-        ],
-    );
-    assert_eq!(
-        result.map(support::close_record),
-        Ok(Type::function(vec![record], typ("Int")))
+    assert_req!(
+        result.map(|t| t.to_string()),
+        Ok("forall a . { x : Int, y : Int | a } -> Int".to_string())
     );
 }
 
 #[test]
 fn infer_additional_fields() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 let f vec = vec.x #Int+ vec.y
@@ -50,7 +44,7 @@ f { x = 1, y = 2, z = 3 }
 
 #[test]
 fn field_access_on_record_with_type() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 type Test = Int
@@ -63,7 +57,7 @@ record.y
 
 #[test]
 fn record_unpack() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 let f record =
@@ -80,10 +74,10 @@ f { y = 1.0, z = 0, x = 123 }
 // then fails to unify if it is unified with only typevariables (`$0 $1`)
 #[test]
 fn late_merge_with_signature() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
-type Monad m = { flat_map : (a -> m b) -> m a -> m b }
+type Monad m = { flat_map : forall a b . (a -> m b) -> m a -> m b }
 type Test a = { value : a }
 let monad : Monad Test = {
     flat_map = \f x -> f x.value
@@ -96,7 +90,7 @@ monad
 
 #[test]
 fn equality_of_records_with_differing_fields() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 let eq x y : a -> a -> () = ()
@@ -112,7 +106,7 @@ let f v1 v2 =
 
 #[test]
 fn associated_types() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 type Test = Int
@@ -126,7 +120,7 @@ let { Test } = { Test, Test2, x = 2 }
 
 #[test]
 fn unused_associated_types_pattern_match() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 type Test = Int
@@ -139,7 +133,7 @@ let { x } = { Test, x = 2 }
 
 #[test]
 fn if_else_different_records() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 if True then
@@ -153,7 +147,7 @@ else
 
 #[test]
 fn missing_field() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 let f vec = vec.x #Int+ vec.y
@@ -166,7 +160,7 @@ f { x = 1 }
 
 #[test]
 fn different_order_of_fields() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 if True then
@@ -182,7 +176,7 @@ else
 
 #[test]
 fn different_order_of_fields_does_not_cause_polymorphism() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 let record =
@@ -199,7 +193,7 @@ record.z
 
 #[test]
 fn record_unpack_missing_field() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 let f record =
@@ -213,7 +207,7 @@ f { y = 1.0, z = 0 }
 
 #[test]
 fn missing_associated_types() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let text = r#"
 type Test = Int
@@ -224,7 +218,6 @@ let { Test3 } = { Test, Test2, x = 2 }
     let result = support::typecheck(text);
     assert!(result.is_err());
 }
-
 
 #[test]
 fn row_kinds() {
@@ -244,7 +237,6 @@ fn row_kinds() {
     let result = kindcheck.kindcheck_expected(&mut typ, &Kind::row());
     assert_eq!(result, Ok(Kind::row()));
 }
-
 
 #[test]
 fn row_kinds_error() {

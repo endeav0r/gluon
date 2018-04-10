@@ -1,10 +1,12 @@
 //! Module containing the types which make up `gluon`'s AST (Abstract Syntax Tree)
+use std::fmt;
 use std::marker::PhantomData;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 use pos::{self, BytePos, HasSpan, Span, Spanned};
 use symbol::Symbol;
-use types::{self, Alias, AliasData, ArcType, Type, TypeEnv};
+use types::{self, Alias, AliasData, ArcType, ArgType, Generic, Type, TypeEnv};
+use ordered_float::NotNaN;
 
 pub trait DisplayEnv {
     type Ident;
@@ -66,6 +68,18 @@ impl<Id> Deref for AstType<Id> {
     }
 }
 
+impl<Id> DerefMut for AstType<Id> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self._typ.1.value
+    }
+}
+
+impl<Id: AsRef<str>> fmt::Display for AstType<Id> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", types::TypeFormatter::new(self))
+    }
+}
+
 impl<Id> From<Spanned<Type<Id, AstType<Id>>, BytePos>> for AstType<Id> {
     fn from(typ: Spanned<Type<Id, AstType<Id>>, BytePos>) -> Self {
         AstType {
@@ -112,6 +126,25 @@ impl<Id> AstType<Id> {
     pub fn into_inner(self) -> Type<Id, Self> {
         self._typ.1.value
     }
+
+    pub fn as_mut(&mut self) -> &mut SpannedAstType<Id> {
+        &mut self._typ.1
+    }
+
+    pub fn params_mut(&mut self) -> &mut [Generic<Id>] {
+        match self._typ.1.value {
+            Type::Forall(ref mut params, _, _) => params,
+            Type::App(ref mut id, _) => id.params_mut(),
+            _ => &mut [],
+        }
+    }
+
+    pub fn remove_single_forall(&mut self) -> &mut AstType<Id> {
+        match self._typ.1.value {
+            Type::Forall(_, ref mut typ, _) => return typ,
+            _ => self,
+        }
+    }
 }
 
 pub trait Commented {
@@ -154,11 +187,11 @@ where
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
     Byte(u8),
     Int(i64),
-    Float(f64),
+    Float(NotNaN<f64>),
     String(String),
     Char(char),
 }
@@ -174,17 +207,27 @@ pub struct PatternField<Id, P> {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Pattern<Id> {
+    /// An as-pattern, eg. `option @ { monoid, functor }`
+    As(Id, Box<SpannedPattern<Id>>),
+    /// Constructor pattern, eg. `Cons x xs`
     Constructor(TypedIdent<Id>, Vec<SpannedPattern<Id>>),
+    /// Ident pattern, eg: `x`
+    Ident(TypedIdent<Id>),
+    /// Record pattern, eg. `{ x, y = foo }`
     Record {
         typ: ArcType<Id>,
         types: Vec<PatternField<Id, Id>>,
         fields: Vec<PatternField<Id, SpannedPattern<Id>>>,
+        implicit_import: Option<Spanned<Id, BytePos>>,
     },
+    /// Tuple pattern, eg: `(x, y)`
     Tuple {
         typ: ArcType<Id>,
         elems: Vec<SpannedPattern<Id>>,
     },
-    Ident(TypedIdent<Id>),
+    /// A literal pattern
+    Literal(Literal),
+    /// An invalid pattern
     Error,
 }
 
@@ -203,7 +246,7 @@ pub struct Array<Id> {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Lambda<Id> {
     pub id: TypedIdent<Id>,
-    pub args: Vec<SpannedIdent<Id>>,
+    pub args: Vec<Argument<Id>>,
     pub body: Box<SpannedExpr<Id>>,
 }
 
@@ -211,11 +254,23 @@ pub type SpannedExpr<Id> = Spanned<Expr<Id>, BytePos>;
 
 pub type SpannedIdent<Id> = Spanned<TypedIdent<Id>, BytePos>;
 
+pub type SpannedAlias<Id> = Spanned<AliasData<Id, AstType<Id>>, BytePos>;
+
+pub type SpannedAstType<Id> = Spanned<Type<Id, AstType<Id>>, BytePos>;
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct ExprField<Id, E> {
     pub comment: Option<Comment>,
     pub name: Spanned<Id, BytePos>,
     pub value: Option<E>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Do<Id> {
+    pub id: SpannedIdent<Id>,
+    pub bound: Box<SpannedExpr<Id>>,
+    pub body: Box<SpannedExpr<Id>>,
+    pub flat_map_id: Option<Box<SpannedExpr<Id>>>,
 }
 
 /// The representation of gluon's expression syntax
@@ -226,7 +281,11 @@ pub enum Expr<Id> {
     /// Literal values
     Literal(Literal),
     /// Function application, eg. `f x`
-    App(Box<SpannedExpr<Id>>, Vec<SpannedExpr<Id>>),
+    App {
+        func: Box<SpannedExpr<Id>>,
+        implicit_args: Vec<SpannedExpr<Id>>,
+        args: Vec<SpannedExpr<Id>>,
+    },
     /// Lambda abstraction, eg. `\x y -> x * y`
     Lambda(Lambda<Id>),
     /// If-then-else conditional
@@ -238,7 +297,12 @@ pub enum Expr<Id> {
     /// Pattern match expression
     Match(Box<SpannedExpr<Id>>, Vec<Alternative<Id>>),
     /// Infix operator expression eg. `f >> g`
-    Infix(Box<SpannedExpr<Id>>, SpannedIdent<Id>, Box<SpannedExpr<Id>>),
+    Infix {
+        lhs: Box<SpannedExpr<Id>>,
+        op: SpannedIdent<Id>,
+        rhs: Box<SpannedExpr<Id>>,
+        implicit_args: Vec<SpannedExpr<Id>>,
+    },
     /// Record field projection, eg. `value.field`
     Projection(Box<SpannedExpr<Id>>, Id, ArcType<Id>),
     /// Array construction
@@ -248,6 +312,7 @@ pub enum Expr<Id> {
         typ: ArcType<Id>,
         types: Vec<ExprField<Id, ArcType<Id>>>,
         exprs: Vec<ExprField<Id, SpannedExpr<Id>>>,
+        base: Option<Box<SpannedExpr<Id>>>,
     },
     /// Tuple construction
     Tuple {
@@ -260,15 +325,19 @@ pub enum Expr<Id> {
     TypeBindings(Vec<TypeBinding<Id>>, Box<SpannedExpr<Id>>),
     /// A group of sequenced expressions
     Block(Vec<SpannedExpr<Id>>),
+    Do(Do<Id>),
     /// An invalid expression
-    Error,
+    Error(
+        /// Provides a hint of what type the expression would have, if any
+        Option<ArcType<Id>>,
+    ),
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct TypeBinding<Id> {
     pub comment: Option<Comment>,
     pub name: Spanned<Id, BytePos>,
-    pub alias: Spanned<AliasData<Id, AstType<Id>>, BytePos>,
+    pub alias: SpannedAlias<Id>,
     pub finalized_alias: Option<Alias<Id, ArcType<Id>>>,
 }
 
@@ -278,6 +347,27 @@ impl<Id> TypeBinding<Id> {
     }
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub struct Argument<Id> {
+    pub arg_type: ArgType,
+    pub name: SpannedIdent<Id>,
+}
+
+impl<Id> Argument<Id> {
+    pub fn explicit(name: SpannedIdent<Id>) -> Self {
+        Argument {
+            arg_type: ArgType::Explicit,
+            name,
+        }
+    }
+
+    pub fn implicit(name: SpannedIdent<Id>) -> Self {
+        Argument {
+            arg_type: ArgType::Implicit,
+            name,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct ValueBinding<Id> {
@@ -285,7 +375,7 @@ pub struct ValueBinding<Id> {
     pub name: SpannedPattern<Id>,
     pub typ: Option<AstType<Id>>,
     pub resolved_type: ArcType<Id>,
-    pub args: Vec<SpannedIdent<Id>>,
+    pub args: Vec<Argument<Id>>,
     pub expr: SpannedExpr<Id>,
 }
 
@@ -296,47 +386,87 @@ impl<Id> ValueBinding<Id> {
 }
 
 /// Visitor trait which walks over expressions calling `visit_*` on all encountered elements. By
-/// default the `visit_*` functions just walk the tree. If they are overriden the user will need to
+/// default the `visit_*` functions just walk the tree. If they are overridden the user will need to
 /// call `walk_mut_*` to continue traversing the tree.
-pub trait MutVisitor {
-    type Ident;
+pub trait MutVisitor<'a> {
+    type Ident: 'a;
 
-    fn visit_expr(&mut self, e: &mut SpannedExpr<Self::Ident>) {
+    fn visit_expr(&mut self, e: &'a mut SpannedExpr<Self::Ident>) {
         walk_mut_expr(self, e);
     }
 
-    fn visit_pattern(&mut self, e: &mut SpannedPattern<Self::Ident>) {
+    fn visit_pattern(&mut self, e: &'a mut SpannedPattern<Self::Ident>) {
         walk_mut_pattern(self, &mut e.value);
     }
 
-    fn visit_typ(&mut self, _: &mut ArcType<Self::Ident>) {}
+    fn visit_spanned_typed_ident(&mut self, id: &'a mut SpannedIdent<Self::Ident>) {
+        self.visit_ident(&mut id.value)
+    }
+
+    fn visit_ident(&mut self, id: &'a mut TypedIdent<Self::Ident>) {
+        self.visit_typ(&mut id.typ)
+    }
+
+    fn visit_alias(&mut self, alias: &'a mut SpannedAlias<Self::Ident>) {
+        walk_mut_alias(self, alias)
+    }
+    fn visit_spanned_ident(&mut self, _: &'a mut Spanned<Self::Ident, BytePos>) {}
+    fn visit_typ(&mut self, _: &'a mut ArcType<Self::Ident>) {}
+    fn visit_ast_type(&mut self, s: &'a mut SpannedAstType<Self::Ident>) {
+        walk_mut_ast_type(self, s);
+    }
 }
 
-pub fn walk_mut_expr<V: ?Sized + MutVisitor>(v: &mut V, e: &mut SpannedExpr<V::Ident>) {
+pub fn walk_mut_alias<'a, V: ?Sized + MutVisitor<'a>>(
+    v: &mut V,
+    alias: &'a mut SpannedAlias<V::Ident>,
+) {
+    v.visit_ast_type(&mut alias.value.unresolved_type_mut()._typ.1);
+}
+
+pub fn walk_mut_expr<'a, V: ?Sized + MutVisitor<'a>>(v: &mut V, e: &'a mut SpannedExpr<V::Ident>) {
     match e.value {
         Expr::IfElse(ref mut pred, ref mut if_true, ref mut if_false) => {
             v.visit_expr(pred);
             v.visit_expr(if_true);
             v.visit_expr(if_false);
         }
-        Expr::Infix(ref mut lhs, ref mut id, ref mut rhs) => {
+        Expr::Infix {
+            ref mut lhs,
+            ref mut op,
+            ref mut rhs,
+            ref mut implicit_args,
+        } => {
             v.visit_expr(lhs);
-            v.visit_typ(&mut id.value.typ);
+            v.visit_spanned_typed_ident(op);
             v.visit_expr(rhs);
+            for arg in implicit_args {
+                v.visit_expr(arg);
+            }
         }
         Expr::LetBindings(ref mut bindings, ref mut body) => {
             for bind in bindings {
                 v.visit_pattern(&mut bind.name);
                 for arg in &mut bind.args {
-                    v.visit_typ(&mut arg.value.typ);
+                    v.visit_spanned_typed_ident(&mut arg.name);
                 }
                 v.visit_typ(&mut bind.resolved_type);
                 v.visit_expr(&mut bind.expr);
+                if let Some(ref mut ast_type) = bind.typ {
+                    v.visit_ast_type(&mut ast_type._typ.1)
+                }
             }
             v.visit_expr(body);
         }
-        Expr::App(ref mut func, ref mut args) => {
+        Expr::App {
+            ref mut func,
+            ref mut implicit_args,
+            ref mut args,
+        } => {
             v.visit_expr(func);
+            for arg in implicit_args {
+                v.visit_expr(arg);
+            }
             for arg in args {
                 v.visit_expr(arg);
             }
@@ -360,14 +490,23 @@ pub fn walk_mut_expr<V: ?Sized + MutVisitor>(v: &mut V, e: &mut SpannedExpr<V::I
         }
         Expr::Record {
             ref mut typ,
+            ref mut types,
             ref mut exprs,
+            ref mut base,
             ..
         } => {
             v.visit_typ(typ);
+            for typ in types {
+                v.visit_spanned_ident(&mut typ.name);
+            }
             for field in exprs {
+                v.visit_spanned_ident(&mut field.name);
                 if let Some(ref mut expr) = field.value {
                     v.visit_expr(expr);
                 }
+            }
+            if let Some(ref mut base) = *base {
+                v.visit_expr(base);
             }
         }
         Expr::Tuple {
@@ -382,24 +521,48 @@ pub fn walk_mut_expr<V: ?Sized + MutVisitor>(v: &mut V, e: &mut SpannedExpr<V::I
         Expr::Block(ref mut exprs) => for expr in exprs {
             v.visit_expr(expr);
         },
+
+        Expr::Do(Do {
+            ref mut id,
+            ref mut bound,
+            ref mut body,
+            ref mut flat_map_id,
+        }) => {
+            v.visit_spanned_typed_ident(id);
+            v.visit_expr(bound);
+            v.visit_expr(body);
+            if let Some(ref mut flat_map_id) = *flat_map_id {
+                v.visit_expr(flat_map_id);
+            }
+        }
+
         Expr::Lambda(ref mut lambda) => {
-            v.visit_typ(&mut lambda.id.typ);
+            v.visit_ident(&mut lambda.id);
             for arg in &mut lambda.args {
-                v.visit_typ(&mut arg.value.typ);
+                v.visit_spanned_typed_ident(&mut arg.name);
             }
             v.visit_expr(&mut lambda.body);
         }
-        Expr::TypeBindings(_, ref mut expr) => v.visit_expr(expr),
-        Expr::Ident(ref mut id) => v.visit_typ(&mut id.typ),
-        Expr::Literal(..) | Expr::Error => (),
+        Expr::TypeBindings(ref mut bindings, ref mut expr) => {
+            for binding in bindings.iter_mut() {
+                v.visit_spanned_ident(&mut binding.name);
+                v.visit_alias(&mut binding.alias);
+            }
+            v.visit_expr(expr)
+        }
+        Expr::Ident(ref mut id) => v.visit_ident(id),
+        Expr::Literal(..) | Expr::Error(..) => (),
     }
 }
 
 /// Walks a pattern, calling `visit_*` on all relevant elements
-pub fn walk_mut_pattern<V: ?Sized + MutVisitor>(v: &mut V, p: &mut Pattern<V::Ident>) {
+pub fn walk_mut_pattern<'a, V: ?Sized + MutVisitor<'a>>(v: &mut V, p: &'a mut Pattern<V::Ident>) {
     match *p {
+        Pattern::As(_, ref mut pat) => {
+            v.visit_pattern(pat);
+        }
         Pattern::Constructor(ref mut id, ref mut args) => {
-            v.visit_typ(&mut id.typ);
+            v.visit_ident(id);
             for arg in args {
                 v.visit_pattern(arg);
             }
@@ -411,6 +574,7 @@ pub fn walk_mut_pattern<V: ?Sized + MutVisitor>(v: &mut V, p: &mut Pattern<V::Id
         } => {
             v.visit_typ(typ);
             for field in fields {
+                v.visit_spanned_ident(&mut field.name);
                 if let Some(ref mut pattern) = field.value {
                     v.visit_pattern(pattern);
                 }
@@ -425,8 +589,53 @@ pub fn walk_mut_pattern<V: ?Sized + MutVisitor>(v: &mut V, p: &mut Pattern<V::Id
                 v.visit_pattern(elem);
             }
         }
-        Pattern::Ident(ref mut id) => v.visit_typ(&mut id.typ),
-        Pattern::Error => (),
+        Pattern::Ident(ref mut id) => v.visit_ident(id),
+        Pattern::Literal(_) | Pattern::Error => (),
+    }
+}
+
+pub fn walk_mut_ast_type<'a, V: ?Sized + MutVisitor<'a>>(
+    v: &mut V,
+    s: &'a mut SpannedAstType<V::Ident>,
+) {
+    match s.value {
+        Type::Hole | Type::Opaque | Type::Builtin(_) => (),
+        Type::Forall(_, ref mut ast_type, ref mut ast_types) => {
+            v.visit_ast_type(&mut ast_type._typ.1);
+            if let &mut Some(ref mut ast_types) = ast_types {
+                for ast_type in ast_types {
+                    v.visit_ast_type(&mut ast_type._typ.1);
+                }
+            }
+        }
+        Type::Function(_, ref mut arg, ref mut ret) => {
+            v.visit_ast_type(&mut arg._typ.1);
+            v.visit_ast_type(&mut ret._typ.1);
+        }
+        Type::App(ref mut ast_type, ref mut ast_types) => {
+            for ast_type in ast_types.iter_mut() {
+                v.visit_ast_type(&mut ast_type._typ.1);
+            }
+            v.visit_ast_type(&mut ast_type._typ.1)
+        }
+        Type::Record(ref mut ast_type) => v.visit_ast_type(&mut ast_type._typ.1),
+        Type::Variant(ref mut ast_type) => v.visit_ast_type(&mut ast_type._typ.1),
+        Type::EmptyRow => (),
+        Type::ExtendRow {
+            types: _,
+            ref mut fields,
+            ref mut rest,
+        } => {
+            for field in fields.iter_mut() {
+                v.visit_ast_type(&mut field.typ._typ.1);
+            }
+            v.visit_ast_type(&mut rest._typ.1);
+        }
+        Type::Ident(_) => (),
+        Type::Variable(_) => (),
+        Type::Generic(_) => (),
+        Type::Alias(_) => (),
+        Type::Skolem(_) => (),
     }
 }
 
@@ -451,10 +660,18 @@ pub fn walk_expr<'a, V: ?Sized + Visitor<'a>>(v: &mut V, e: &'a SpannedExpr<V::I
             v.visit_expr(if_true);
             v.visit_expr(if_false);
         }
-        Expr::Infix(ref lhs, ref id, ref rhs) => {
+        Expr::Infix {
+            ref lhs,
+            ref op,
+            ref rhs,
+            ref implicit_args,
+        } => {
             v.visit_expr(lhs);
-            v.visit_typ(&id.value.typ);
+            v.visit_typ(&op.value.typ);
             v.visit_expr(rhs);
+            for arg in implicit_args {
+                v.visit_expr(arg);
+            }
         }
         Expr::LetBindings(ref bindings, ref body) => {
             for bind in bindings {
@@ -463,8 +680,15 @@ pub fn walk_expr<'a, V: ?Sized + Visitor<'a>>(v: &mut V, e: &'a SpannedExpr<V::I
             }
             v.visit_expr(body);
         }
-        Expr::App(ref func, ref args) => {
+        Expr::App {
+            ref func,
+            ref implicit_args,
+            ref args,
+        } => {
             v.visit_expr(func);
+            for arg in implicit_args {
+                v.visit_expr(arg);
+            }
             for arg in args {
                 v.visit_expr(arg);
             }
@@ -487,7 +711,10 @@ pub fn walk_expr<'a, V: ?Sized + Visitor<'a>>(v: &mut V, e: &'a SpannedExpr<V::I
             }
         }
         Expr::Record {
-            ref typ, ref exprs, ..
+            ref typ,
+            ref exprs,
+            ref base,
+            ..
         } => {
             v.visit_typ(typ);
             for field in exprs {
@@ -495,26 +722,40 @@ pub fn walk_expr<'a, V: ?Sized + Visitor<'a>>(v: &mut V, e: &'a SpannedExpr<V::I
                     v.visit_expr(expr);
                 }
             }
+            if let Some(ref base) = *base {
+                v.visit_expr(base);
+            }
         }
         Expr::Tuple {
             elems: ref exprs, ..
-        } |
-        Expr::Block(ref exprs) => for expr in exprs {
+        }
+        | Expr::Block(ref exprs) => for expr in exprs {
             v.visit_expr(expr);
         },
+        Expr::Do(Do {
+            ref bound,
+            ref body,
+            ..
+        }) => {
+            v.visit_expr(bound);
+            v.visit_expr(body);
+        }
         Expr::Lambda(ref lambda) => {
             v.visit_typ(&lambda.id.typ);
             v.visit_expr(&lambda.body);
         }
         Expr::TypeBindings(_, ref expr) => v.visit_expr(expr),
         Expr::Ident(ref id) => v.visit_typ(&id.typ),
-        Expr::Literal(..) | Expr::Error => (),
+        Expr::Literal(..) | Expr::Error(..) => (),
     }
 }
 
 /// Walks a pattern, calling `visit_*` on all relevant elements
 pub fn walk_pattern<'a, V: ?Sized + Visitor<'a>>(v: &mut V, p: &'a Pattern<V::Ident>) {
     match *p {
+        Pattern::As(_, ref pat) => {
+            v.visit_pattern(&pat);
+        }
         Pattern::Constructor(ref id, ref args) => {
             v.visit_typ(&id.typ);
             for arg in args {
@@ -540,7 +781,7 @@ pub fn walk_pattern<'a, V: ?Sized + Visitor<'a>>(v: &mut V, p: &'a Pattern<V::Id
             }
         }
         Pattern::Ident(ref id) => v.visit_typ(&id.typ),
-        Pattern::Error => (),
+        Pattern::Literal(_) | Pattern::Error => (),
     }
 }
 
@@ -549,61 +790,58 @@ pub fn walk_pattern<'a, V: ?Sized + Visitor<'a>>(v: &mut V, p: &'a Pattern<V::Id
 pub trait Typed {
     type Ident;
 
-    fn env_type_of(&self, env: &TypeEnv) -> ArcType<Self::Ident>;
+    fn env_type_of(&self, env: &TypeEnv) -> ArcType<Self::Ident> {
+        self.try_type_of(env).unwrap()
+    }
+
+    fn try_type_of(&self, env: &TypeEnv) -> Result<ArcType<Self::Ident>, String>;
 }
 
 impl<Id: Clone> Typed for TypedIdent<Id> {
     type Ident = Id;
 
-    fn env_type_of(&self, _: &TypeEnv) -> ArcType<Id> {
-        self.typ.clone()
+    fn try_type_of(&self, _: &TypeEnv) -> Result<ArcType<Id>, String> {
+        Ok(self.typ.clone())
     }
 }
 
 impl Typed for Literal {
     type Ident = Symbol;
 
-    fn env_type_of(&self, _: &TypeEnv) -> ArcType {
-        match *self {
+    fn try_type_of(&self, _: &TypeEnv) -> Result<ArcType, String> {
+        Ok(match *self {
             Literal::Int(_) => Type::int(),
             Literal::Float(_) => Type::float(),
             Literal::Byte(_) => Type::byte(),
             Literal::String(_) => Type::string(),
             Literal::Char(_) => Type::char(),
-        }
+        })
     }
 }
 
 impl Typed for Expr<Symbol> {
     type Ident = Symbol;
 
-    fn env_type_of(&self, env: &TypeEnv) -> ArcType {
+    fn try_type_of(&self, env: &TypeEnv) -> Result<ArcType, String> {
         match *self {
-            Expr::Ident(ref id) => id.typ.clone(),
-            Expr::Projection(_, _, ref typ) |
-            Expr::Record { ref typ, .. } |
-            Expr::Tuple { ref typ, .. } => typ.clone(),
-            Expr::Literal(ref lit) => lit.env_type_of(env),
-            Expr::IfElse(_, ref arm, _) => arm.env_type_of(env),
-            Expr::Infix(_, ref op, _) => {
-                if let Type::App(_, ref args) = *op.value.typ.clone() {
-                    if let Type::App(_, ref args) = *args[1] {
-                        return args[1].clone();
-                    }
-                }
-                panic!("Expected function type in binop");
-            }
-            Expr::LetBindings(_, ref expr) | Expr::TypeBindings(_, ref expr) => {
-                expr.env_type_of(env)
-            }
-            Expr::App(ref func, ref args) => {
-                get_return_type(env, &func.env_type_of(env), args.len())
-            }
-            Expr::Match(_, ref alts) => alts[0].expr.env_type_of(env),
-            Expr::Array(ref array) => array.typ.clone(),
-            Expr::Lambda(ref lambda) => lambda.id.typ.clone(),
-            Expr::Block(ref exprs) => exprs.last().expect("Expr in block").env_type_of(env),
-            Expr::Error => Type::hole(),
+            Expr::Ident(ref id) => Ok(id.typ.clone()),
+            Expr::Projection(_, _, ref typ)
+            | Expr::Record { ref typ, .. }
+            | Expr::Tuple { ref typ, .. } => Ok(typ.clone()),
+            Expr::Literal(ref lit) => lit.try_type_of(env),
+            Expr::IfElse(_, ref arm, _) => arm.try_type_of(env),
+            Expr::Infix { ref op, .. } => get_return_type(env, &op.value.typ, 2),
+            Expr::LetBindings(_, ref expr)
+            | Expr::TypeBindings(_, ref expr)
+            | Expr::Do(Do { body: ref expr, .. }) => expr.try_type_of(env),
+            Expr::App {
+                ref func, ref args, ..
+            } => get_return_type(env, &func.try_type_of(env)?, args.len()),
+            Expr::Match(_, ref alts) => alts[0].expr.try_type_of(env),
+            Expr::Array(ref array) => Ok(array.typ.clone()),
+            Expr::Lambda(ref lambda) => Ok(lambda.id.typ.clone()),
+            Expr::Block(ref exprs) => exprs.last().expect("Expr in block").try_type_of(env),
+            Expr::Error(ref typ) => Ok(typ.clone().unwrap_or_else(|| Type::hole())),
         }
     }
 }
@@ -611,49 +849,53 @@ impl Typed for Expr<Symbol> {
 impl<T: Typed> Typed for Spanned<T, BytePos> {
     type Ident = T::Ident;
 
-    fn env_type_of(&self, env: &TypeEnv) -> ArcType<T::Ident> {
-        self.value.env_type_of(env)
+    fn try_type_of(&self, env: &TypeEnv) -> Result<ArcType<T::Ident>, String> {
+        self.value.try_type_of(env)
     }
 }
 
 impl Typed for Pattern<Symbol> {
     type Ident = Symbol;
-
-    fn env_type_of(&self, env: &TypeEnv) -> ArcType {
+    fn try_type_of(&self, env: &TypeEnv) -> Result<ArcType, String> {
         // Identifier patterns might be a function so use the identifier's type instead
         match *self {
-            Pattern::Ident(ref id) => id.typ.clone(),
-            Pattern::Record { ref typ, .. } => typ.clone(),
-            Pattern::Tuple { ref typ, .. } => typ.clone(),
+            Pattern::As(_, ref pat) => pat.try_type_of(env),
+            Pattern::Ident(ref id) => Ok(id.typ.clone()),
+            Pattern::Record { ref typ, .. } => Ok(typ.clone()),
+            Pattern::Tuple { ref typ, .. } => Ok(typ.clone()),
             Pattern::Constructor(ref id, ref args) => get_return_type(env, &id.typ, args.len()),
-            Pattern::Error => Type::hole(),
+            Pattern::Error => Ok(Type::hole()),
+            Pattern::Literal(ref l) => l.try_type_of(env),
         }
     }
 }
 
-fn get_return_type(env: &TypeEnv, alias_type: &ArcType, arg_count: usize) -> ArcType {
+fn get_return_type(
+    env: &TypeEnv,
+    alias_type: &ArcType,
+    arg_count: usize,
+) -> Result<ArcType, String> {
     // We don't want to panic if we attempt to get the return type of a hole so return a type hole
     // as the return type
     if arg_count == 0 || **alias_type == Type::Hole {
-        return alias_type.clone();
+        return Ok(alias_type.clone());
     }
 
+    let alias_type = alias_type.remove_forall_and_implicit_args();
     if let Some((_, ret)) = alias_type.as_function() {
         return get_return_type(env, ret, arg_count - 1);
     }
 
     let alias = {
-        let alias_ident = alias_type.alias_ident().unwrap_or_else(|| {
-            panic!(
-                "ICE: Expected function with {} more arguments, found {:?}",
-                arg_count,
-                alias_type
+        let alias_ident = alias_type.alias_ident().ok_or_else(|| {
+            format!(
+                "Expected function with {} more arguments, found {:?}",
+                arg_count, alias_type
             )
-        });
+        })?;
 
-        env.find_type_info(alias_ident).unwrap_or_else(|| {
-            panic!("Unexpected type {} is not a function", alias_type)
-        })
+        env.find_type_info(alias_ident)
+            .ok_or_else(|| format!("Unexpected type {} is not a function", alias_type))?
     };
 
     let typ = types::walk_move_type(alias.typ().into_owned(), &mut |typ| {
@@ -662,9 +904,9 @@ fn get_return_type(env: &TypeEnv, alias_type: &ArcType, arg_count: usize) -> Arc
                 // Replace the generic variable with the type from the list
                 // or if it is not found the make a fresh variable
                 alias
-                    .args
+                    .params()
                     .iter()
-                    .zip(alias_type.unapplied_args())
+                    .zip(&*alias_type.unapplied_args())
                     .find(|&(arg, _)| arg.id == generic.id)
                     .map(|(_, typ)| typ.clone())
             }
@@ -676,7 +918,7 @@ fn get_return_type(env: &TypeEnv, alias_type: &ArcType, arg_count: usize) -> Arc
 }
 
 pub fn is_operator_char(c: char) -> bool {
-    "#+-*/&|=<>:.".chars().any(|x| x == c)
+    "!#$%&*+-./<=>?@\\^|-~:".chars().any(|x| x == c)
 }
 
 pub fn is_constructor(s: &str) -> bool {
@@ -684,4 +926,20 @@ pub fn is_constructor(s: &str) -> bool {
         .next()
         .unwrap()
         .starts_with(char::is_uppercase)
+}
+
+pub fn expr_to_path(expr: &SpannedExpr<Symbol>, path: &mut String) -> Result<(), &'static str> {
+    match expr.value {
+        Expr::Ident(ref id) => {
+            path.push_str(id.name.declared_name());
+            Ok(())
+        }
+        Expr::Projection(ref expr, ref id, _) => {
+            expr_to_path(expr, path)?;
+            path.push('.');
+            path.push_str(id.declared_name());
+            Ok(())
+        }
+        _ => return Err("Expected a string literal or path to import"),
+    }
 }

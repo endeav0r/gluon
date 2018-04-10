@@ -1,8 +1,14 @@
-let prelude = import! "std/prelude.glu"
+let prelude @ { Ordering, ? } = import! std.prelude
 let { Semigroup, Monoid, Eq, Show } = prelude
-let { Functor, Applicative, Alternative, Monad, Foldable, Traversable } = prelude
-let { Bool } = import! "std/bool.glu"
-let string = import! "std/string.glu"
+let { Functor, Applicative, Alternative, Monad, Traversable } = prelude
+let { Foldable } = import! std.foldable
+let { Bool } = import! std.bool
+let string @ { ? } = import! std.string
+let array @ { ? } = import! std.array
+
+let { map } = import! std.functor
+let { (<*>), wrap } = import! std.applicative
+let { (<|>) } = import! std.applicative
 
 /// A linked list type
 type List a = | Nil | Cons a (List a)
@@ -30,16 +36,18 @@ let semigroup : Semigroup (List a) =
 
     { append }
 
+let { (<>) } = import! std.prelude
+
 let monoid : Monoid (List a) = {
     semigroup = semigroup,
-    empty = Nil
+    empty = Nil,
 }
 
-let eq a : Eq a -> Eq (List a) =
+let eq ?eq : [Eq a] -> Eq (List a) =
     let (==) l r =
         match (l, r) with
         | (Nil, Nil) -> True
-        | (Cons x xs, Cons y ys) -> a.(==) x y && xs == ys
+        | (Cons x xs, Cons y ys) -> eq.(==) x y && xs == ys
         | _ -> False
     { (==) }
 
@@ -51,7 +59,6 @@ let functor : Functor List =
     { map }
 
 let applicative : Applicative List =
-    let { (<>) } = prelude.make_Semigroup semigroup
 
     let apply f xs =
         match f with
@@ -61,32 +68,31 @@ let applicative : Applicative List =
 
     { functor = functor, apply, wrap }
 
+let many ?alt x : [Alternative f] -> f a -> f (List a) =
 
-let many alternative x : Alternative f -> f a -> f (List a) =
-    let { applicative, (<|>) } = prelude.make_Alternative alternative
-    let { functor, (<*>), wrap } = prelude.make_Applicative applicative
-
-    let many_v _ = some_v () <|> wrap Nil
-    and some_v _ = functor.map (\h l -> Cons h l) x <*> many_v ()
+    let many_v _ =
+        some_v () <|> wrap Nil
+    and some_v _ =
+        let { ? } = alt.applicative
+        map (\h l -> Cons h l) x <*> many_v ()
     many_v ()
 
-let some alternative x : Alternative f -> f a -> f (List a) =
-    let { applicative, (<|>) } = prelude.make_Alternative alternative
-    let { functor, (<*>), wrap } = prelude.make_Applicative applicative
+let some ?alt x : [Alternative f] -> f a -> f (List a) =
 
-    let many_v _ = some_v () <|> wrap Nil
-    and some_v _ = functor.map (\h l -> Cons h l) x <*> many_v ()
+    let many_v _ =
+        some_v () <|> wrap Nil
+    and some_v _ =
+        let { ? } = alt.applicative
+        map (\h l -> Cons h l) x <*> many_v ()
     some_v ()
 
 let alternative : Alternative List = {
     applicative = applicative,
     or = semigroup.append,
-    empty = Nil
+    empty = Nil,
 }
 
 let monad : Monad List =
-    let { (<>) } = prelude.make_Semigroup semigroup
-
     let flat_map f xs =
         match xs with
         | Cons x ys -> (f x) <> (flat_map f ys)
@@ -94,7 +100,7 @@ let monad : Monad List =
 
     { applicative = applicative, flat_map }
 
-let show : Show a -> Show (List a) = \d ->
+let show ?d : [Show a] -> Show (List a) =
     let (++) = string.semigroup.append
 
     {
@@ -107,7 +113,7 @@ let show : Show a -> Show (List a) = \d ->
                     | Nil -> d.show y
                 | Nil -> ""
 
-            "[" ++ show_elems xs ++ "]"
+            "[" ++ show_elems xs ++ "]",
     }
 
 let foldable : Foldable List =
@@ -129,8 +135,37 @@ let traversable : Traversable List = {
     traverse = \app f ->
         foldable.foldr
             (\a b -> app.apply (app.functor.map Cons (f a)) b)
-            (app.wrap Nil)
+            (app.wrap Nil),
 }
+
+let filter predicate xs : (a -> Bool) -> List a -> List a =
+    match xs with
+    | Nil -> Nil
+    | Cons y ys ->
+        let rest = filter predicate ys
+        if predicate y then Cons y rest else rest
+
+let scan compare xs less equal greater : (a -> Ordering)
+        -> List a
+        -> List a
+        -> List a
+        -> List a
+        -> { _0 : List a, _1 : List a, _2 : List a } =
+    match xs with
+    | Nil -> (less, equal, greater)
+    | Cons y ys ->
+        match compare y with
+        | LT -> scan compare ys (Cons y less) equal greater
+        | EQ -> scan compare ys less (Cons y equal) greater
+        | GT -> scan compare ys less equal (Cons y greater)
+
+let sort ?ord xs : [Ord a] -> List a -> List a =
+    match xs with
+    | Nil -> Nil
+    | Cons pivot ys ->
+        let (less, equal, greater) = scan (\a -> ord.compare a pivot) ys Nil (Cons pivot Nil) Nil
+        sort less <> equal <> sort greater
+
 
 {
     List,
@@ -146,5 +181,7 @@ let traversable : Traversable List = {
     monad,
     show,
     foldable,
-    traversable
+    traversable,
+    filter,
+    sort,
 }

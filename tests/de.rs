@@ -14,14 +14,14 @@ use gluon::{new_vm, Compiler};
 
 #[test]
 fn bool() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let (De(b), _) = Compiler::new()
         .run_expr::<De<bool>>(
             &thread,
             "test",
-            r#"let { Bool } = import! "std/bool.glu" in True"#,
+            r#"let { Bool } = import! std.bool in True"#,
         )
         .unwrap_or_else(|err| panic!("{}", err));
     assert_eq!(b, true);
@@ -56,14 +56,14 @@ impl VmType for Record {
 
 #[test]
 fn option() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let (De(opt), _) = Compiler::new()
         .run_expr::<De<Option<f64>>>(
             &thread,
             "test",
-            r#"let { Option } = import! "std/option.glu" in Some 1.0 "#,
+            r#"let { Option } = import! std.option in Some 1.0 "#,
         )
         .unwrap_or_else(|err| panic!("{}", err));
     assert_eq!(opt, Some(1.0));
@@ -71,7 +71,7 @@ fn option() {
 
 #[test]
 fn partial_record() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let (De(record), _) = Compiler::new()
@@ -89,7 +89,6 @@ fn partial_record() {
         }
     );
 }
-
 
 #[derive(Debug, PartialEq, Deserialize)]
 struct OptionalFieldRecord {
@@ -115,7 +114,7 @@ impl VmType for OptionalFieldRecord {
 
 #[test]
 fn optional_field() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
 
@@ -123,20 +122,20 @@ fn optional_field() {
         .run_expr::<OpaqueValue<&Thread, Hole>>(&thread, "test", r#" { } "#)
         .unwrap_or_else(|err| panic!("{}", err));
     assert_eq!(
-        De::<OptionalFieldRecord>::from_value(&thread, value.get_variants()).map(|x| x.0),
-        Some(OptionalFieldRecord { test: None })
+        De::<OptionalFieldRecord>::from_value(&thread, value.get_variant()).0,
+        OptionalFieldRecord { test: None }
     );
 
     let (value, _) = Compiler::new()
         .run_expr::<OpaqueValue<&Thread, Hole>>(
             &thread,
             "test",
-            r#"let { Option } = import! "std/option.glu" in { test = Some 2 } "#,
+            r#"let { Option } = import! std.option in { test = Some 2 } "#,
         )
         .unwrap_or_else(|err| panic!("{}", err));
     assert_eq!(
-        De::<OptionalFieldRecord>::from_value(&thread, value.get_variants()).map(|x| x.0),
-        Some(OptionalFieldRecord { test: Some(2) })
+        De::<OptionalFieldRecord>::from_value(&thread, value.get_variant()).0,
+        OptionalFieldRecord { test: Some(2) }
     );
 
     let (value, _) = Compiler::new()
@@ -154,7 +153,7 @@ fn optional_field() {
         Type::hole(),
     );
     assert_eq!(
-        de::from_value(&thread, value.get_variants(), &typ).ok(),
+        de::from_value(&thread, value.get_variant(), &typ).ok(),
         Some(OptionalFieldRecord { test: Some(1) })
     );
 }
@@ -176,7 +175,7 @@ impl VmType for Enum {
 
 #[test]
 fn enum_() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     Compiler::new()

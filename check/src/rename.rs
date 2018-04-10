@@ -1,274 +1,154 @@
-use std::fmt;
-
-use base::ast::{self, DisplayEnv, Expr, MutVisitor, Pattern, SpannedExpr, Typed, TypedIdent};
-use base::error::Errors;
-use base::fnv::FnvMap;
-use base::kind::{ArcKind, Kind, KindEnv};
-use base::pos::{self, BytePos, Span, Spanned};
+use base::ast::{self, DisplayEnv, Do, Expr, MutVisitor, Pattern, SpannedAlias, SpannedExpr,
+                TypedIdent};
+use base::pos::{self, BytePos, Span};
 use base::scoped_map::ScopedMap;
-use base::symbol::{Symbol, SymbolModule, SymbolRef};
-use base::types::{self, Alias, ArcType, RecordSelector, Type, TypeEnv};
-use unify_type::{State, TypeError};
-use unify::{Error as UnifyError, Unifiable, Unifier, UnifierState};
+use base::symbol::{Symbol, SymbolModule};
+use base::types::{self, Type};
 
-pub type Error = Errors<Spanned<RenameError, BytePos>>;
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum RenameError {
-    NoMatchingType {
-        symbol: String,
-        expected: ArcType,
-        possible_types: Vec<(Option<Span<BytePos>>, ArcType)>,
-    },
+struct Environment {
+    stack: ScopedMap<Symbol, (Symbol, Span<BytePos>)>,
 }
 
-impl fmt::Display for RenameError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            RenameError::NoMatchingType {
-                ref symbol,
-                ref expected,
-                ref possible_types,
-            } => {
-                writeln!(
-                    f,
-                    "Could not resolve a binding for `{}` with type `{}`",
-                    symbol,
-                    expected
-                )?;
-                writeln!(f, "Possibilities:")?;
-                for &(ref span, ref typ) in possible_types {
-                    match *span {
-                        Some(ref span) => writeln!(f, "{} at {}", typ, span.start)?,
-                        None => writeln!(f, "{} at 'global'", typ)?,
-                    }
-                }
-                Ok(())
-            }
-        }
+pub fn rename(symbols: &mut SymbolModule, expr: &mut SpannedExpr<Symbol>) {
+    enum TailCall {
+        TailCall,
+        Return,
     }
-}
-
-struct Environment<'b> {
-    env: &'b TypeEnv,
-    stack: ScopedMap<Symbol, (Symbol, Span<BytePos>, ArcType)>,
-    stack_types: ScopedMap<Symbol, Alias<Symbol, ArcType>>,
-}
-
-impl<'a> KindEnv for Environment<'a> {
-    fn find_kind(&self, _type_name: &SymbolRef) -> Option<ArcKind> {
-        None
-    }
-}
-
-impl<'a> TypeEnv for Environment<'a> {
-    fn find_type(&self, id: &SymbolRef) -> Option<&ArcType> {
-        self.stack
-            .get(id)
-            .map(|t| &t.2)
-            .or_else(|| self.env.find_type(id))
-    }
-
-    fn find_type_info(&self, id: &SymbolRef) -> Option<&Alias<Symbol, ArcType>> {
-        self.stack_types
-            .get(id)
-            .or_else(|| self.env.find_type_info(id))
-    }
-
-    fn find_record(
-        &self,
-        _fields: &[Symbol],
-        _selector: RecordSelector,
-    ) -> Option<(ArcType, ArcType)> {
-        None
-    }
-}
-
-pub fn rename(
-    symbols: &mut SymbolModule,
-    env: &TypeEnv,
-    expr: &mut SpannedExpr<Symbol>,
-) -> Result<(), Error> {
-    use base::resolve;
 
     struct RenameVisitor<'a: 'b, 'b> {
         symbols: &'b mut SymbolModule<'a>,
-        env: Environment<'b>,
-        errors: Error,
+        env: Environment,
     }
 
     impl<'a, 'b> RenameVisitor<'a, 'b> {
-        fn find_fields(&self, typ: &ArcType) -> Vec<types::Field<Symbol, ArcType>> {
-            // Walk through all type aliases
-            let record = resolve::remove_aliases(&self.env, typ.clone());
-            record.row_iter().cloned().collect()
-        }
-
-        fn new_pattern(&mut self, typ: &ArcType, pattern: &mut ast::SpannedPattern<Symbol>) {
+        fn new_pattern(&mut self, pattern: &mut ast::SpannedPattern<Symbol>) {
             match pattern.value {
-                ast::Pattern::Record {
+                Pattern::Record {
                     ref mut fields,
-                    ref types,
+                    ref mut implicit_import,
                     ..
                 } => {
-                    let field_types = self.find_fields(typ);
                     for field in fields {
-                        let field_type = &field_types
-                            .iter()
-                            .find(|field_type| field_type.name.name_eq(&field.name.value))
-                            .expect("ICE: Existing field")
-                            .typ;
                         match field.value {
-                            Some(ref mut pat) => self.new_pattern(field_type, pat),
+                            Some(ref mut pat) => self.new_pattern(pat),
                             None => {
                                 let id = field.name.value.clone();
                                 let pat = Pattern::Ident(TypedIdent {
-                                    name: self.stack_var(id, pattern.span, field_type.clone()),
-                                    typ: field_type.clone(),
+                                    name: self.stack_var(id, pattern.span),
+                                    typ: Type::hole(),
                                 });
-                                field.value = Some(pos::spanned(pattern.span, pat));
+                                field.value = Some(pos::spanned(field.name.span, pat));
                             }
                         }
                     }
-
-                    let record_type = resolve::remove_aliases(&self.env, typ.clone()).clone();
-                    for ast_field in types {
-                        let field_type = record_type
-                            .type_field_iter()
-                            .find(|field| field.name.name_eq(&ast_field.name.value))
-                            .expect("field_type");
-                        self.stack_type(
-                            ast_field.name.value.clone(),
-                            pattern.span,
-                            &field_type.typ,
-                        );
+                    if let Some(ref mut implicit_import) = *implicit_import {
+                        let new_name =
+                            self.stack_var(implicit_import.value.clone(), implicit_import.span);
+                        implicit_import.value = new_name;
                     }
                 }
-                ast::Pattern::Ident(ref mut id) => {
-                    let new_name = self.stack_var(id.name.clone(), pattern.span, id.typ.clone());
+                Pattern::Ident(ref mut id) => {
+                    let new_name = self.stack_var(id.name.clone(), pattern.span);
                     id.name = new_name;
                 }
-                ast::Pattern::Tuple {
-                    ref typ,
-                    ref mut elems,
-                } => for (field, elem) in typ.row_iter().zip(elems) {
-                    self.new_pattern(&field.typ, elem);
-                },
-                ast::Pattern::Constructor(ref mut id, ref mut args) => {
-                    let typ = self.env
-                        .find_type(&id.name)
-                        .expect("ICE: Expected constructor")
-                        .clone();
-                    for (arg_type, arg) in types::arg_iter(&typ).zip(args) {
-                        self.new_pattern(arg_type, arg);
-                    }
+                Pattern::As(ref mut id, ref mut pat) => {
+                    let new_name = self.stack_var(id.clone(), pattern.span);
+                    *id = new_name;
+                    self.new_pattern(pat)
                 }
-                ast::Pattern::Error => (),
+                Pattern::Tuple { ref mut elems, .. } => for elem in elems {
+                    self.new_pattern(elem);
+                },
+                Pattern::Constructor(_, ref mut args) => for arg in args {
+                    self.new_pattern(arg);
+                },
+                Pattern::Literal(_) | Pattern::Error => (),
             }
         }
 
-        fn stack_var(&mut self, id: Symbol, span: Span<BytePos>, typ: ArcType) -> Symbol {
+        fn stack_var(&mut self, id: Symbol, span: Span<BytePos>) -> Symbol {
+            use std::fmt::Write;
+
             let old_id = id.clone();
             let name = self.symbols.string(&id).to_owned();
-            let new_id = self.symbols.symbol(format!("{}:{}", name, span.start));
+            let mut new_name = format!("{}:{}", name, span.start);
+            let mut i = 0;
+            while self.symbols.contains_name(&new_name) {
+                let truncate_len = new_name
+                    .trim_right_matches(|c: char| c.is_digit(10) || c == '_')
+                    .len();
+                new_name.truncate(truncate_len);
+
+                write!(new_name, "_{}", i).unwrap();
+                i += 1;
+            }
+            let new_id = self.symbols.symbol(new_name);
             debug!(
-                "Rename binding `{}` = `{}` `{}`",
+                "Rename binding `{}` = `{}`",
                 self.symbols.string(&old_id),
                 self.symbols.string(&new_id),
-                typ
             );
-            self.env.stack.insert(old_id, (new_id.clone(), span, typ));
+            self.env.stack.insert(old_id, (new_id.clone(), span));
             new_id
         }
 
-        fn stack_type(&mut self, id: Symbol, span: Span<BytePos>, alias: &Alias<Symbol, ArcType>) {
+        fn stack_type(&mut self, span: Span<BytePos>, alias: &SpannedAlias<Symbol>) {
             // Insert variant constructors into the local scope
-            let aliased_type = alias.typ();
-            if let Type::Variant(ref row) = **aliased_type {
-                for field in row.row_iter().cloned() {
+            let aliased_type = alias.value.unresolved_type();
+            if let Type::Variant(ref row) = **types::remove_forall(aliased_type) {
+                for field in types::row_iter(row).cloned() {
                     self.env
                         .stack
-                        .insert(field.name.clone(), (field.name, span, field.typ));
+                        .insert(field.name.clone(), (field.name, span));
                 }
             }
-
-            // FIXME: Workaround so that both the types name in this module and its global
-            // name are imported. Without this aliases may not be traversed properly
-            self.env
-                .stack_types
-                .insert(alias.name.clone(), alias.clone());
-            self.env.stack_types.insert(id, alias.clone());
         }
 
         /// Renames `id` to the unique identifier which have the type `expected`
         /// Returns `Some(new_id)` if renaming was necessary or `None` if no renaming was necessary
         /// as `id` was currently unique (#Int+, #Float*, etc)
-        fn rename(&self, id: &Symbol, expected: &ArcType) -> Result<Option<Symbol>, RenameError> {
-            let locals = self.env.stack.get_all(id);
-            let global = self.env.env.find_type(id).map(|typ| (id, None, typ));
-            let candidates = || {
-                locals
-                    .iter()
-                    .flat_map(|bindings| {
-                        bindings
-                            .iter()
-                            .rev()
-                            .map(|bind| (&bind.0, Some(&bind.1), &bind.2))
-                    })
-                    .chain(global)
-            };
-            // If there is a single binding (or no binding in case of primitives such as #Int+)
-            // there is no need to check for equivalency as typechecker couldnt have infered a
-            // different binding
-            if candidates().count() <= 1 {
-                return Ok(candidates().next().map(|tup| tup.0.clone()));
-            }
-            candidates()
-                .find(|tup| equivalent(&self.env, tup.2, expected))
-                .map(|tup| Some(tup.0.clone()))
-                .ok_or_else(|| {
-                    RenameError::NoMatchingType {
-                        symbol: String::from(self.symbols.string(id)),
-                        expected: expected.clone(),
-                        possible_types: candidates()
-                            .map(|tup| (tup.1.cloned(), tup.2.clone()))
-                            .collect(),
-                    }
-                })
+        fn rename(&self, id: &Symbol) -> Option<Symbol> {
+            self.env.stack.get(id).map(|t| t.0.clone())
         }
 
-        fn rename_expr(&mut self, expr: &mut SpannedExpr<Symbol>) -> Result<(), RenameError> {
+        fn rename_expr(&mut self, expr: &mut SpannedExpr<Symbol>) -> TailCall {
             match expr.value {
-                Expr::Ident(ref mut id) => if let Some(new_id) = self.rename(&id.name, &id.typ)? {
+                Expr::Ident(ref mut id) => if let Some(new_id) = self.rename(&id.name) {
                     debug!("Rename identifier {} = {}", id.name, new_id);
                     id.name = new_id;
                 },
                 Expr::Record {
-                    ref mut typ,
                     ref mut exprs,
+                    ref mut base,
                     ..
                 } => {
-                    let field_types = self.find_fields(typ);
-                    for (field, expr_field) in field_types.iter().zip(exprs) {
+                    for expr_field in exprs {
                         match expr_field.value {
                             Some(ref mut expr) => self.visit_expr(expr),
-                            None => if let Some(new_id) =
-                                self.rename(&expr_field.name.value, &field.typ)?
-                            {
+                            None => if let Some(new_id) = self.rename(&expr_field.name.value) {
                                 debug!("Rename record field {} = {}", expr_field.name, new_id);
                                 expr_field.value = Some(pos::spanned(
-                                    expr.span,
+                                    expr_field.name.span,
                                     Expr::Ident(TypedIdent {
                                         name: new_id,
-                                        typ: field.typ.clone(),
+                                        typ: Type::hole(),
                                     }),
                                 ));
                             },
                         }
                     }
+
+                    if let Some(ref mut base) = *base {
+                        self.visit_expr(base);
+                    }
                 }
-                Expr::Infix(ref mut lhs, ref mut op, ref mut rhs) => {
-                    if let Some(new_id) = self.rename(&op.value.name, &op.value.typ)? {
+                Expr::Infix {
+                    ref mut lhs,
+                    ref mut op,
+                    ref mut rhs,
+                    ref mut implicit_args,
+                } => {
+                    if let Some(new_id) = self.rename(&op.value.name) {
                         debug!(
                             "Rename {} = {}",
                             self.symbols.string(&op.value.name),
@@ -278,154 +158,133 @@ pub fn rename(
                     }
                     self.visit_expr(lhs);
                     self.visit_expr(rhs);
+                    for arg in implicit_args {
+                        self.visit_expr(arg);
+                    }
                 }
                 Expr::Match(ref mut expr, ref mut alts) => {
                     self.visit_expr(expr);
                     for alt in alts {
-                        self.env.stack_types.enter_scope();
                         self.env.stack.enter_scope();
-                        let typ = expr.env_type_of(&self.env);
-                        self.new_pattern(&typ, &mut alt.pattern);
+                        self.new_pattern(&mut alt.pattern);
                         self.visit_expr(&mut alt.expr);
                         self.env.stack.exit_scope();
-                        self.env.stack_types.exit_scope();
                     }
                 }
                 Expr::LetBindings(ref mut bindings, ref mut expr) => {
-                    self.env.stack_types.enter_scope();
                     self.env.stack.enter_scope();
                     let is_recursive = bindings.iter().all(|bind| !bind.args.is_empty());
                     for bind in bindings.iter_mut() {
                         if !is_recursive {
                             self.visit_expr(&mut bind.expr);
                         }
-                        self.new_pattern(&bind.resolved_type, &mut bind.name);
+                        if let Some(ref mut typ) = bind.typ {
+                            self.visit_ast_type(typ.as_mut())
+                        }
+                        self.new_pattern(&mut bind.name);
                     }
                     if is_recursive {
                         for bind in bindings {
                             self.env.stack.enter_scope();
-                            for (typ, arg) in
-                                types::arg_iter(&bind.resolved_type).zip(&mut bind.args)
-                            {
-                                arg.value.name =
-                                    self.stack_var(arg.value.name.clone(), expr.span, typ.clone());
+                            for arg in &mut bind.args {
+                                arg.name.value.name =
+                                    self.stack_var(arg.name.value.name.clone(), expr.span);
                             }
                             self.visit_expr(&mut bind.expr);
                             self.env.stack.exit_scope();
                         }
                     }
-                    self.visit_expr(expr);
-                    self.env.stack.exit_scope();
-                    self.env.stack_types.exit_scope();
+                    return TailCall::TailCall;
                 }
                 Expr::Lambda(ref mut lambda) => {
                     self.env.stack.enter_scope();
-                    for (typ, arg) in types::arg_iter(&lambda.id.typ).zip(&mut lambda.args) {
-                        arg.value.name =
-                            self.stack_var(arg.value.name.clone(), expr.span, typ.clone());
+
+                    for arg in &mut lambda.args {
+                        arg.name.value.name =
+                            self.stack_var(arg.name.value.name.clone(), expr.span);
                     }
+
                     self.visit_expr(&mut lambda.body);
+
                     self.env.stack.exit_scope();
                 }
-                Expr::TypeBindings(ref bindings, ref mut body) => {
-                    self.env.stack_types.enter_scope();
+                Expr::TypeBindings(ref bindings, _) => {
+                    self.env.stack.enter_scope();
                     for bind in bindings {
-                        self.stack_type(
-                            bind.name.value.clone(),
-                            expr.span,
-                            bind.finalized_alias.as_ref().expect(
-                                "ICE: Alias should have been finalized \
-                                 before renaming",
-                            ),
-                        );
+                        self.stack_type(expr.span, &bind.alias);
                     }
-                    self.visit_expr(body);
-                    self.env.stack_types.exit_scope();
+
+                    return TailCall::TailCall;
                 }
+                Expr::Do(Do {
+                    ref mut id,
+                    ref mut bound,
+                    ref mut flat_map_id,
+                    ..
+                }) => {
+                    let flat_map = self.symbols.symbol("flat_map");
+                    *flat_map_id = Some(Box::new(pos::spanned(
+                        id.span,
+                        Expr::Ident(TypedIdent {
+                            name: flat_map,
+                            typ: Type::hole(),
+                        }),
+                    )));
+
+                    let flat_map_id = flat_map_id
+                        .as_mut()
+                        .unwrap_or_else(|| ice!("flat_map_id not set before renaming"));
+
+                    self.visit_expr(flat_map_id);
+                    self.visit_expr(bound);
+
+                    self.env.stack.enter_scope();
+
+                    id.value.name = self.stack_var(id.value.name.clone(), id.span);
+
+                    return TailCall::TailCall;
+                }
+
                 _ => ast::walk_mut_expr(self, expr),
             }
-            Ok(())
+            TailCall::Return
         }
     }
 
-    impl<'a, 'b> MutVisitor for RenameVisitor<'a, 'b> {
+    impl<'a, 'b, 'c> MutVisitor<'c> for RenameVisitor<'a, 'b> {
         type Ident = Symbol;
 
-        fn visit_expr(&mut self, expr: &mut SpannedExpr<Self::Ident>) {
-            if let Err(err) = self.rename_expr(expr) {
-                self.errors.push(Spanned {
-                    span: expr.span,
-                    value: err,
-                });
+        fn visit_expr(&mut self, mut expr: &mut SpannedExpr<Self::Ident>) {
+            let mut i = 0;
+            loop {
+                match self.rename_expr(expr) {
+                    TailCall::Return => break,
+                    TailCall::TailCall => {
+                        expr = match { expr }.value {
+                            Expr::LetBindings(_, ref mut new_expr)
+                            | Expr::TypeBindings(_, ref mut new_expr)
+                            | Expr::Do(Do {
+                                body: ref mut new_expr,
+                                ..
+                            }) => new_expr,
+                            _ => ice!("Only Let and Type expressions can tailcall"),
+                        };
+                        i += 1;
+                    }
+                }
+            }
+
+            for _ in 0..i {
+                self.env.stack.exit_scope();
             }
         }
     }
 
     let mut visitor = RenameVisitor {
         symbols: symbols,
-        errors: Errors::new(),
         env: Environment {
-            env: env,
             stack: ScopedMap::new(),
-            stack_types: ScopedMap::new(),
         },
     };
     visitor.visit_expr(expr);
-    if visitor.errors.has_errors() {
-        Err(visitor.errors)
-    } else {
-        Ok(())
-    }
-}
-
-pub fn equivalent(env: &TypeEnv, actual: &ArcType, inferred: &ArcType) -> bool {
-    use substitution::Substitution;
-    // FIXME This Substitution is unnecessary for equivalence unification
-    let subs = Substitution::new(Kind::typ());
-    let mut unifier = UnifierState {
-        state: State::new(env, &subs),
-        unifier: Equivalent {
-            map: FnvMap::default(),
-            equiv: true,
-        },
-    };
-    unifier.try_match(actual, inferred);
-    unifier.unifier.equiv
-}
-
-struct Equivalent {
-    map: FnvMap<Symbol, ArcType>,
-    equiv: bool,
-}
-
-impl<'a> Unifier<State<'a>, ArcType> for Equivalent {
-    fn report_error(
-        unifier: &mut UnifierState<State<'a>, Self>,
-        _error: UnifyError<ArcType, TypeError<Symbol>>,
-    ) {
-        unifier.unifier.equiv = false;
-    }
-
-    fn try_match_res(
-        unifier: &mut UnifierState<State<'a>, Self>,
-        l: &ArcType,
-        r: &ArcType,
-    ) -> Result<Option<ArcType>, UnifyError<ArcType, TypeError<Symbol>>> {
-        debug!("{} ====> {}", l, r);
-        match (&**l, &**r) {
-            (&Type::Generic(ref gl), &Type::Generic(ref gr)) if gl == gr => Ok(None),
-            (&Type::Generic(ref gl), _) => match unifier.unifier.map.get(&gl.id).cloned() {
-                Some(ref typ) => unifier.try_match_res(typ, r),
-                None => {
-                    unifier.unifier.map.insert(gl.id.clone(), r.clone());
-                    Ok(None)
-                }
-            },
-            _ => l.zip_match(r, unifier),
-        }
-    }
-
-    fn error_type(_unifier: &mut UnifierState<State<'a>, Self>) -> Option<ArcType> {
-        None
-    }
 }

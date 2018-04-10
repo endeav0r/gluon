@@ -1,19 +1,19 @@
-let { run, writer, assert_eq }  = import! "std/test.glu"
-let prelude  = import! "std/prelude.glu"
-let { Bool } = import! "std/bool.glu"
-let int = import! "std/int.glu"
-let result = import! "std/result.glu"
-let { Result } = result
-let string = import! "std/string.glu"
-let unit = import! "std/unit.glu"
-let { (*>) } = prelude.make_Applicative writer.applicative
-let { (>>=) } = prelude.make_Monad writer.monad
+let { run, Test, assert_eq, test, ? }  = import! std.test
+let { (<|) } = import! std.function
+let prelude  = import! std.prelude
+let { Bool } = import! std.bool
+let int = import! std.int
+let result @ { Result, ? } = import! std.result
+let string = import! std.string
+let unit @ { ? } = import! std.unit
+let { Applicative, (*>) } = import! std.applicative
+let { flat_map } = import! std.monad
+let { send, recv, channel } = import! std.channel
+let { spawn, yield, resume } = import! std.thread
 
-let assert =
-    assert_eq (result.show unit.show int.show) (result.eq unit.eq int.eq)
 let assert_any_err =
-    assert_eq (result.show string.show unit.show)
-              (result.eq { (==) = \x y -> True } unit.eq)
+    assert_eq ?(result.show ?string.show ?unit.show)
+              ?(result.eq ?{ (==) = \x y -> True } ?unit.eq)
 
 let { sender, receiver } = channel 0
 
@@ -25,14 +25,14 @@ let thread = spawn (\_ ->
     )
 resume thread
 
-let tests =
-    assert (recv receiver) (Ok 0) *>
-        assert (recv receiver) (Err ()) >>= (\_ ->
+let tests : Test () =
+    assert_eq (recv receiver) (Ok 0) *> (
+            do _ = assert_eq (recv receiver) (Err ())
             resume thread
-            assert (recv receiver) (Ok 1)
-        ) *>
-        assert (recv receiver) (Err ()) >>= (\_ ->
+            assert_eq (recv receiver) (Ok 1)
+        ) *> (
+            do _ = assert_eq (recv receiver) (Err ())
             assert_any_err (resume thread) (Err "Any error message here")
         )
 
-run tests
+test "thread" <| \_ -> tests

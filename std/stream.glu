@@ -1,11 +1,9 @@
-let prelude = import! "std/prelude.glu"
-and { Functor, Applicative } = prelude
-let int = import! "std/int.glu"
-and { (+) } = int.num
-let list = import! "std/list.glu"
-let { Bool } = import! "std/bool.glu"
-let { List } = list
-let { Option } = import! "std/option.glu"
+let { Functor, Applicative } = import! std.prelude
+let int @ { num = { (+) } } = import! std.int
+let list @ { List } = import! std.list
+let { Bool } = import! std.bool
+let { Option } = import! std.option
+let { lazy, force } = import! std.lazy
 
 type Stream_ a = | Value a (Stream a) | Empty
 and Stream a = Lazy (Stream_ a)
@@ -54,6 +52,8 @@ let functor : Functor Stream =
     { map }
 
 {
+    Stream,
+
     from,
     repeat,
     next,
@@ -61,5 +61,5 @@ let functor : Functor Stream =
     fold,
     to_list,
     zip_with,
-    functor
+    functor,
 }

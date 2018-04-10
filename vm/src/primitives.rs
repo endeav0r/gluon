@@ -3,20 +3,20 @@ use std::result::Result as StdResult;
 use std::string::String as StdString;
 use std::str::FromStr;
 
-use {Error, Variants};
-use primitives as prim;
-use api::{generic, primitive, Array, Generic, Getable, RuntimeResult, WithVM};
+use {Error, ExternModule, Variants};
+use api::{generic, primitive, Array, Generic, Getable, Pushable, RuntimeResult, ValueRef, WithVM};
 use api::generic::A;
 use gc::{DataDef, Gc, Traverseable, WriteOnly};
 use Result;
 use vm::{Status, Thread};
-use value::{Def, GcStr, Repr, Value, ValueArray};
+use value::{Def, GcStr, Repr, ValueArray, ValueRepr};
 use stack::StackFrame;
+use thread::ThreadInternal;
 use types::VmInt;
 
-mod array {
+#[doc(hidden)]
+pub mod array {
     use super::*;
-    use thread::ThreadInternal;
 
     pub fn len(array: Array<generic::A>) -> VmInt {
         array.len() as VmInt
@@ -87,17 +87,17 @@ mod array {
             }
         };
         unsafe {
-            RuntimeResult::Return(
-                Getable::from_value(lhs.vm(), Variants::new(&Value::Array(value))).expect("Array"),
-            )
+            RuntimeResult::Return(Getable::from_value(
+                lhs.vm(),
+                Variants::new(&ValueRepr::Array(value).into()),
+            ))
         }
     }
 }
 
 mod string {
     use super::*;
-    use api::AsyncPushable;
-    use thread::ThreadInternal;
+    use api::Pushable;
 
     pub fn append(lhs: WithVM<&str>, rhs: &str) -> RuntimeResult<String, Error> {
         struct StrAppend<'b> {
@@ -141,9 +141,10 @@ mod string {
             }
         };
         unsafe {
-            RuntimeResult::Return(
-                Getable::from_value(vm, Variants::new(&Value::String(value))).expect("Array"),
-            )
+            RuntimeResult::Return(Getable::from_value(
+                vm,
+                Variants::new(&ValueRepr::String(value).into()),
+            ))
         }
     }
 
@@ -166,36 +167,34 @@ mod string {
 
     pub extern "C" fn from_utf8(thread: &Thread) -> Status {
         let mut context = thread.context();
-        let value = StackFrame::current(&mut context.stack)[0];
+        let value = StackFrame::current(&mut context.stack)[0].get_repr();
         match value {
-            Value::Array(array) => {
-                match GcStr::from_utf8(array) {
-                    Ok(string) => {
-                        let value = Value::String(string);
-                        let result = context.alloc_with(
-                            thread,
-                            Def {
-                                tag: 1,
-                                elems: &[value],
-                            },
-                        );
-                        match result {
-                            Ok(data) => {
-                                context.stack.push(Value::Data(data));
-                                Status::Ok
-                            }
-                            Err(err) => {
-                                let result: RuntimeResult<(), _> = RuntimeResult::Panic(err);
-                                result.status_push(thread, &mut context)
-                            }
+            ValueRepr::Array(array) => match GcStr::from_utf8(array) {
+                Ok(string) => {
+                    let value = ValueRepr::String(string).into();
+                    let result = context.alloc_with(
+                        thread,
+                        Def {
+                            tag: 1,
+                            elems: &[value],
+                        },
+                    );
+                    match result {
+                        Ok(data) => {
+                            context.stack.push(ValueRepr::Data(data));
+                            Status::Ok
+                        }
+                        Err(err) => {
+                            let result: RuntimeResult<(), _> = RuntimeResult::Panic(err);
+                            result.status_push(thread, &mut context)
                         }
                     }
-                    Err(()) => {
+                }
+                Err(()) => {
                     let err: StdResult<&str, ()> = Err(());
                     err.status_push(thread, &mut context)
                 }
-                }
-            }
+            },
             _ => unreachable!(),
         }
     }
@@ -235,18 +234,61 @@ fn show_char(c: char) -> String {
     format!("{}", c)
 }
 
+fn show_byte(c: u8) -> String {
+    format!("{}", c)
+}
+
 extern "C" fn error(_: &Thread) -> Status {
     // We expect a string as an argument to this function but we only return Status::Error
     // and let the caller take care of printing the message
     Status::Error
 }
 
+extern "C" fn discriminant_value(thread: &Thread) -> Status {
+    let mut context = thread.context();
+    let tag = {
+        let mut stack = StackFrame::current(&mut context.stack);
+        let value = stack.get_variant(0).unwrap();
+        match value.as_ref() {
+            ValueRef::Data(data) => data.tag(),
+            _ => 0,
+        }
+    };
+    tag.push(thread, &mut context).unwrap();
+    Status::Ok
+}
+
 #[allow(non_camel_case_types)]
-pub fn load(vm: &Thread) -> Result<()> {
+mod std {
+    pub use primitives as prim;
+
+    pub mod string {
+        pub type prim = str;
+    }
+    pub mod char {
+        pub type prim = char;
+    }
+    pub mod array {
+        pub use primitives::array as prim;
+    }
+    pub mod byte {
+        pub type prim = u8;
+    }
+    pub mod int {
+        pub type prim = ::types::VmInt;
+    }
+    pub mod float {
+        pub type prim = f64;
+    }
+}
+
+#[allow(non_camel_case_types)]
+pub fn load_float(thread: &Thread) -> Result<ExternModule> {
     use std::f64;
-    type float_prim = f64;
-    vm.define_global(
-        "float_prim",
+    use self::std;
+
+    ExternModule::new(
+        thread,
         record! {
             digits => f64::DIGITS,
             epsilon => f64::EPSILON,
@@ -264,156 +306,210 @@ pub fn load(vm: &Thread) -> Result<()> {
             e => f64::consts::E,
             pi => f64::consts::PI,
             radix => f64::RADIX,
-            is_nan => primitive!(1 float_prim::is_nan),
-            is_infinite => primitive!(1 float_prim::is_infinite),
-            is_finite => primitive!(1 float_prim::is_finite),
-            is_normal => primitive!(1 float_prim::is_normal),
-            floor => primitive!(1 float_prim::floor),
-            ceil => primitive!(1 float_prim::ceil),
-            round => primitive!(1 float_prim::round),
-            trunc => primitive!(1 float_prim::trunc),
-            fract => primitive!(1 float_prim::fract),
-            abs => primitive!(1 float_prim::abs),
-            signum => primitive!(1 float_prim::signum),
-            is_sign_positive => primitive!(1 float_prim::is_sign_positive),
-            is_sign_negative => primitive!(1 float_prim::is_sign_negative),
-            mul_add => primitive!(3 float_prim::mul_add),
-            recip => primitive!(1 float_prim::recip),
-            powi => primitive!(2 float_prim::powi),
-            powf => primitive!(2 float_prim::powf),
-            sqrt => primitive!(1 float_prim::sqrt),
-            exp => primitive!(1 float_prim::exp),
-            exp2 => primitive!(1 float_prim::exp2),
-            ln => primitive!(1 float_prim::ln),
-            log2 => primitive!(1 float_prim::log2),
-            log10 => primitive!(1 float_prim::log10),
-            to_degrees => primitive!(1 float_prim::to_degrees),
-            to_radians => primitive!(1 float_prim::to_radians),
-            max => primitive!(2 float_prim::max),
-            min => primitive!(2 float_prim::min),
-            cbrt => primitive!(1 float_prim::cbrt),
-            hypot => primitive!(2 float_prim::hypot),
-            sin => primitive!(1 float_prim::sin),
-            cos => primitive!(1 float_prim::cos),
-            tan => primitive!(1 float_prim::tan),
-            acos => primitive!(1 float_prim::acos),
-            atan => primitive!(1 float_prim::atan),
-            atan2 => primitive!(2 float_prim::atan2),
-            sin_cos => primitive!(1 float_prim::sin_cos),
-            exp_m1 => primitive!(1 float_prim::exp_m1),
-            ln_1p => primitive!(1 float_prim::ln_1p),
-            sinh => primitive!(1 float_prim::sinh),
-            cosh => primitive!(1 float_prim::cosh),
-            tanh => primitive!(1 float_prim::tanh),
-            acosh => primitive!(1 float_prim::acosh),
-            atanh => primitive!(1 float_prim::atanh),
-            parse => named_primitive!(1, "float_prim.parse", parse::<f64>)
+            is_nan => primitive!(1 std::float::prim::is_nan),
+            is_infinite => primitive!(1 std::float::prim::is_infinite),
+            is_finite => primitive!(1 std::float::prim::is_finite),
+            is_normal => primitive!(1 std::float::prim::is_normal),
+            floor => primitive!(1 std::float::prim::floor),
+            ceil => primitive!(1 std::float::prim::ceil),
+            round => primitive!(1 std::float::prim::round),
+            trunc => primitive!(1 std::float::prim::trunc),
+            fract => primitive!(1 std::float::prim::fract),
+            abs => primitive!(1 std::float::prim::abs),
+            signum => primitive!(1 std::float::prim::signum),
+            is_sign_positive => primitive!(1 std::float::prim::is_sign_positive),
+            is_sign_negative => primitive!(1 std::float::prim::is_sign_negative),
+            mul_add => primitive!(3 std::float::prim::mul_add),
+            recip => primitive!(1 std::float::prim::recip),
+            powi => primitive!(2 std::float::prim::powi),
+            powf => primitive!(2 std::float::prim::powf),
+            sqrt => primitive!(1 std::float::prim::sqrt),
+            exp => primitive!(1 std::float::prim::exp),
+            exp2 => primitive!(1 std::float::prim::exp2),
+            ln => primitive!(1 std::float::prim::ln),
+            log2 => primitive!(1 std::float::prim::log2),
+            log10 => primitive!(1 std::float::prim::log10),
+            to_degrees => primitive!(1 std::float::prim::to_degrees),
+            to_radians => primitive!(1 std::float::prim::to_radians),
+            max => primitive!(2 std::float::prim::max),
+            min => primitive!(2 std::float::prim::min),
+            cbrt => primitive!(1 std::float::prim::cbrt),
+            hypot => primitive!(2 std::float::prim::hypot),
+            sin => primitive!(1 std::float::prim::sin),
+            cos => primitive!(1 std::float::prim::cos),
+            tan => primitive!(1 std::float::prim::tan),
+            acos => primitive!(1 std::float::prim::acos),
+            atan => primitive!(1 std::float::prim::atan),
+            atan2 => primitive!(2 std::float::prim::atan2),
+            sin_cos => primitive!(1 std::float::prim::sin_cos),
+            exp_m1 => primitive!(1 std::float::prim::exp_m1),
+            ln_1p => primitive!(1 std::float::prim::ln_1p),
+            sinh => primitive!(1 std::float::prim::sinh),
+            cosh => primitive!(1 std::float::prim::cosh),
+            tanh => primitive!(1 std::float::prim::tanh),
+            acosh => primitive!(1 std::float::prim::acosh),
+            atanh => primitive!(1 std::float::prim::atanh),
+            from_int => named_primitive!(1, "std.float.prim.from_int", |i: VmInt| i as f64),
+            parse => named_primitive!(1, "std.float.prim.parse", parse::<f64>)
         },
-    )?;
+    )
+}
 
-    use types::VmInt as int_prim;
-    vm.define_global(
-        "int_prim",
+#[allow(non_camel_case_types)]
+pub fn load_byte(vm: &Thread) -> Result<ExternModule> {
+    use self::std;
+    ExternModule::new(
+        vm,
         record! {
-            min_value => int_prim::min_value(),
-            max_value => int_prim::max_value(),
-            count_ones => primitive!(1 int_prim::count_ones),
-            rotate_left => primitive!(2 int_prim::rotate_left),
-            rotate_right => primitive!(2 int_prim::rotate_right),
-            swap_bytes => primitive!(1 int_prim::swap_bytes),
-            from_be => primitive!(1 int_prim::from_be),
-            from_le => primitive!(1 int_prim::from_le),
-            to_be => primitive!(1 int_prim::to_be),
-            to_le => primitive!(1 int_prim::to_le),
-            pow => primitive!(2 int_prim::pow),
-            abs => primitive!(1 int_prim::abs),
-            signum => primitive!(1 int_prim::signum),
-            is_positive => primitive!(1 int_prim::is_positive),
-            is_negative => primitive!(1 int_prim::is_negative),
-            parse => named_primitive!(1, "int_prim.parse", parse::<VmInt>)
+            min_value => std::byte::prim::min_value(),
+            max_value => std::byte::prim::max_value(),
+            count_ones => primitive!(1 std::byte::prim::count_ones),
+            count_zeros => primitive!(1 std::byte::prim::count_zeros),
+            leading_zeros => primitive!(1 std::byte::prim::leading_zeros),
+            trailing_zeros => primitive!(1 std::byte::prim::trailing_zeros),
+            rotate_left => primitive!(2 std::byte::prim::rotate_left),
+            rotate_right => primitive!(2 std::byte::prim::rotate_right),
+            swap_bytes => primitive!(1 std::byte::prim::swap_bytes),
+            from_be => primitive!(1 std::byte::prim::from_be),
+            from_le => primitive!(1 std::byte::prim::from_le),
+            to_be => primitive!(1 std::byte::prim::to_be),
+            to_le => primitive!(1 std::byte::prim::to_le),
+            pow => primitive!(2 std::byte::prim::pow),
+            from_int => named_primitive!(1, "std.byte.prim.from_int", |i: VmInt| i as u8),
+            parse => named_primitive!(1, "std.byte.prim.parse", parse::<u8>)
         },
-    )?;
+    )
+}
 
-    use self::array;
-    vm.define_global(
-        "array",
+#[allow(non_camel_case_types)]
+pub fn load_int(vm: &Thread) -> Result<ExternModule> {
+    use self::std;
+    ExternModule::new(
+        vm,
         record! {
-            len => primitive!(1 array::len),
-            index => primitive!(2 array::index),
-            append => primitive!(2 array::append)
+            min_value => std::int::prim::min_value(),
+            max_value => std::int::prim::max_value(),
+            count_ones => primitive!(1 std::int::prim::count_ones),
+            count_zeros => primitive!(1 std::int::prim::count_zeros),
+            leading_zeros => primitive!(1 std::int::prim::leading_zeros),
+            trailing_zeros => primitive!(1 std::int::prim::trailing_zeros),
+            rotate_left => primitive!(2 std::int::prim::rotate_left),
+            rotate_right => primitive!(2 std::int::prim::rotate_right),
+            swap_bytes => primitive!(1 std::int::prim::swap_bytes),
+            from_be => primitive!(1 std::int::prim::from_be),
+            from_le => primitive!(1 std::int::prim::from_le),
+            to_be => primitive!(1 std::int::prim::to_be),
+            to_le => primitive!(1 std::int::prim::to_le),
+            pow => primitive!(2 std::int::prim::pow),
+            abs => primitive!(1 std::int::prim::abs),
+            signum => primitive!(1 std::int::prim::signum),
+            is_positive => primitive!(1 std::int::prim::is_positive),
+            is_negative => primitive!(1 std::int::prim::is_negative),
+            from_byte => named_primitive!(1, "std.int.prim.from_byte", |b: u8| b as VmInt),
+            from_float => named_primitive!(1, "std.int.prim.from_float", |f: f64| f as VmInt),
+            parse => named_primitive!(1, "std.int.prim.parse", parse::<VmInt>)
         },
-    )?;
+    )
+}
 
+#[allow(non_camel_case_types)]
+pub fn load_array(vm: &Thread) -> Result<ExternModule> {
+    use self::std;
+    ExternModule::new(
+        vm,
+        record! {
+            len => primitive!(1 std::array::prim::len),
+            index => primitive!(2 std::array::prim::index),
+            append => primitive!(2 std::array::prim::append)
+        },
+    )
+}
+
+pub fn load_string(vm: &Thread) -> Result<ExternModule> {
     use self::string;
-    type string_prim = str;
-    vm.define_global(
-        "string_prim",
+    ExternModule::new(
+        vm,
         record! {
-            len => primitive!(1 string_prim::len),
-            is_empty => primitive!(1 string_prim::is_empty),
-            split_at => primitive!(2 string_prim::split_at),
-            find => named_primitive!(2, "string_prim.find", string_prim::find::<&str>),
-            rfind => named_primitive!(2, "string_prim.rfind", string_prim::rfind::<&str>),
-            starts_with => named_primitive!(2, "string_prim.starts_with", string_prim::starts_with::<&str>),
-            ends_with => named_primitive!(2, "string_prim.ends_with", string_prim::ends_with::<&str>),
-            trim => primitive!(1 string_prim::trim),
-            trim_left => primitive!(1 string_prim::trim_left),
-            trim_right => primitive!(1 string_prim::trim_right),
-            compare => named_primitive!(2, "string_prim.compare", string_prim::cmp),
-            append => named_primitive!(2, "string_prim.append", string::append),
-            eq => named_primitive!(2, "string_prim.eq", <str as PartialEq>::eq),
-            slice => named_primitive!(3, "string_prim.slice", string::slice),
-            from_utf8 => primitive::<fn(Vec<u8>) -> StdResult<String, ()>>("string_prim.from_utf8", string::from_utf8),
-            char_at => named_primitive!(2, "string_prim.char_at", string::char_at),
-            as_bytes => primitive!(1 string_prim::as_bytes)
+            len => primitive!(1 std::string::prim::len),
+            is_empty => primitive!(1 std::string::prim::is_empty),
+            split_at => primitive!(2 std::string::prim::split_at),
+            find => named_primitive!(2, "std.string.prim.find", std::string::prim::find::<&str>),
+            rfind => named_primitive!(2, "std.string.prim.rfind", std::string::prim::rfind::<&str>),
+            starts_with => named_primitive!(
+                2,
+                "std.string.prim.starts_with",
+                std::string::prim::starts_with::<&str>
+            ),
+            ends_with => named_primitive!(
+                2,
+                "std.string.prim.ends_with",
+                std::string::prim::ends_with::<&str>
+            ),
+            trim => primitive!(1 std::string::prim::trim),
+            trim_left => primitive!(1 std::string::prim::trim_left),
+            trim_right => primitive!(1 std::string::prim::trim_right),
+            append => named_primitive!(2, "std.string.prim.append", string::append),
+            slice => named_primitive!(3, "std.string.prim.slice", string::slice),
+            from_utf8 => primitive::<fn(Vec<u8>) -> StdResult<String, ()>>(
+                "std.string.prim.from_utf8",
+                string::from_utf8
+            ),
+            char_at => named_primitive!(2, "std.string.prim.char_at", string::char_at),
+            as_bytes => primitive!(1 std::string::prim::as_bytes)
         },
-    )?;
+    )
+}
 
-    use std::char;
-    type char_prim = char;
-    vm.define_global(
-        "char_prim",
+#[allow(non_camel_case_types)]
+pub fn load_char(vm: &Thread) -> Result<ExternModule> {
+    ExternModule::new(
+        vm,
         record! {
-            is_digit => primitive!(2 char_prim::is_digit),
-            to_digit => primitive!(2 char_prim::to_digit),
-            len_utf8 => primitive!(1 char_prim::len_utf8),
-            len_utf16 => primitive!(1 char_prim::len_utf16),
-            is_alphabetic => primitive!(1 char_prim::is_alphabetic),
-            is_lowercase => primitive!(1 char_prim::is_lowercase),
-            is_uppercase => primitive!(1 char_prim::is_uppercase),
-            is_whitespace => primitive!(1 char_prim::is_whitespace),
-            is_alphanumeric => primitive!(1 char_prim::is_alphanumeric),
-            is_control => primitive!(1 char_prim::is_control),
-            is_numeric => primitive!(1 char_prim::is_numeric)
+            from_int => named_primitive!(1, "std.char.prim.from_int", ::std::char::from_u32),
+            to_int => named_primitive!(1, "std.char.prim.to_int", |c: char| c as u32),
+            is_digit => primitive!(2 std::char::prim::is_digit),
+            to_digit => primitive!(2 std::char::prim::to_digit),
+            len_utf8 => primitive!(1 std::char::prim::len_utf8),
+            len_utf16 => primitive!(1 std::char::prim::len_utf16),
+            is_alphabetic => primitive!(1 std::char::prim::is_alphabetic),
+            is_lowercase => primitive!(1 std::char::prim::is_lowercase),
+            is_uppercase => primitive!(1 std::char::prim::is_uppercase),
+            is_whitespace => primitive!(1 std::char::prim::is_whitespace),
+            is_alphanumeric => primitive!(1 std::char::prim::is_alphanumeric),
+            is_control => primitive!(1 std::char::prim::is_control),
+            is_numeric => primitive!(1 std::char::prim::is_numeric),
         },
+    )
+}
+
+#[allow(non_camel_case_types, deprecated)]
+pub fn load(vm: &Thread) -> Result<ExternModule> {
+    use self::std;
+
+    vm.define_global(
+        "@error",
+        primitive::<fn(StdString) -> Generic<A>>("@error", std::prim::error),
     )?;
 
     vm.define_global(
-        "prim",
+        "@string_eq",
+        named_primitive!(2, "@string_eq", <str as PartialEq>::eq),
+    )?;
+
+    ExternModule::new(
+        vm,
         record! {
-            show_int => primitive!(1 prim::show_int),
-            show_float => primitive!(1 prim::show_float),
-            show_char => primitive!(1 prim::show_char)
+            show_int => primitive!(1 std::prim::show_int),
+            show_float => primitive!(1 std::prim::show_float),
+            show_byte => primitive!(1 std::prim::show_byte),
+            show_char => primitive!(1 std::prim::show_char),
+            string_compare => named_primitive!(2, "std.prim.string_compare", str::cmp),
+            string_eq => named_primitive!(2, "std.prim.string_eq", <str as PartialEq>::eq),
+            error => primitive::<fn(StdString) -> Generic<A>>("std.prim.error", std::prim::error),
+            discriminant_value => primitive::<fn(Generic<A>) -> VmInt>(
+                "std.prim.discriminant_value",
+                std::prim::discriminant_value
+            ),
         },
-    )?;
-
-    vm.define_global(
-        "#error",
-        primitive::<fn(StdString) -> Generic<A>>(
-            "#error",
-            prim::error,
-        ),
-    )?;
-
-    vm.define_global(
-        "error",
-        primitive::<fn(StdString) -> Generic<A>>(
-            "error",
-            prim::error,
-        ),
-    )?;
-
-    ::lazy::load(vm)?;
-    ::reference::load(vm)?;
-    Ok(())
+    )
 }

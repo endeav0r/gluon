@@ -1,9 +1,6 @@
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 use std::default::Default;
 use std::fmt;
-use std::sync::Arc;
-
-use itertools::Itertools;
 
 use union_find::{QuickFindUf, Union, UnionByRank, UnionFind, UnionResult};
 
@@ -16,7 +13,6 @@ use base::symbol::Symbol;
 #[derive(Debug, PartialEq)]
 pub enum Error<T> {
     Occurs(T, T),
-    Constraint(T, Arc<Vec<T>>),
 }
 
 impl<T> fmt::Display for Error<T>
@@ -29,24 +25,11 @@ where
 
         match *self {
             Occurs(ref var, ref typ) => write!(f, "Variable `{}` occurs in `{}`.", var, typ),
-            Constraint(ref typ, ref constraints) => {
-                writeln!(
-                    f,
-                    "Type `{}` could not fullfill a constraint.\nPossible resolves:",
-                    typ,
-                )?;
-                for constraint in &constraints[..] {
-                    writeln!(f, "{}", constraint)?;
-                }
-                Ok(())
-            }
         }
     }
 }
 
 use typecheck::unroll_typ;
-
-pub type Constraints<T> = Arc<Vec<T>>;
 
 pub struct Substitution<T>
 where
@@ -54,7 +37,7 @@ where
 {
     /// Union-find data structure used to store the relationships of all variables in the
     /// substitution
-    union: RefCell<QuickFindUf<UnionByLevel<T>>>,
+    union: RefCell<QuickFindUf<UnionByLevel>>,
     /// Vector containing all created variables for this substitution. Needed for the `real` method
     /// which needs to always be able to return a `&T` reference
     variables: FixedVec<T>,
@@ -109,17 +92,17 @@ pub trait Substitutable: Sized {
     fn from_variable(x: Self::Variable) -> Self;
     /// Retrieves the variable if `self` is a variable otherwise returns `None`
     fn get_var(&self) -> Option<&Self::Variable>;
-    fn traverse<F>(&self, f: &mut F)
+    fn traverse<'a, F>(&'a self, f: &mut F)
     where
-        F: Walker<Self>;
-    fn instantiate(
-        &self,
-        subs: &Substitution<Self>,
-        constraints: &FnvMap<Symbol, Constraints<Self>>,
-    ) -> Self;
+        F: Walker<'a, Self>;
+    fn instantiate(&self, subs: &Substitution<Self>) -> Self;
+
+    fn on_union(&self) -> Option<&Self> {
+        None
+    }
 }
 
-fn occurs<T>(typ: &T, subs: &Substitution<T>, var: &T::Variable) -> bool
+pub fn occurs<T>(typ: &T, subs: &Substitution<T>, var: &T::Variable) -> bool
 where
     T: Substitutable,
 {
@@ -128,11 +111,11 @@ where
         var: &'a T::Variable,
         subs: &'a Substitution<T>,
     }
-    impl<'a, T> Walker<T> for Occurs<'a, T>
+    impl<'a, 't, T> Walker<'t, T> for Occurs<'a, T>
     where
         T: Substitutable,
     {
-        fn walk(&mut self, typ: &T) {
+        fn walk(&mut self, typ: &'t T) {
             if self.occurs {
                 return;
             }
@@ -164,33 +147,29 @@ where
 /// map.find(2) -> 1
 /// map.find(1) -> 1
 #[derive(Debug)]
-struct UnionByLevel<T> {
+struct UnionByLevel {
     rank: UnionByRank,
     level: u32,
-    constraints: FnvMap<Symbol, Arc<Vec<T>>>,
 }
 
-impl<T> Default for UnionByLevel<T> {
-    fn default() -> UnionByLevel<T> {
+impl Default for UnionByLevel {
+    fn default() -> UnionByLevel {
         UnionByLevel {
             rank: UnionByRank::default(),
             level: ::std::u32::MAX,
-            constraints: FnvMap::default(),
         }
     }
 }
 
-impl<T> Union for UnionByLevel<T> {
+impl Union for UnionByLevel {
     #[inline]
-    fn union(mut left: UnionByLevel<T>, right: UnionByLevel<T>) -> UnionResult<UnionByLevel<T>> {
+    fn union(left: UnionByLevel, right: UnionByLevel) -> UnionResult<UnionByLevel> {
         use std::cmp::Ordering;
-        left.constraints.extend(right.constraints);
         let (rank_result, rank) = match Union::union(left.rank, right.rank) {
             UnionResult::Left(l) => (
                 UnionResult::Left(UnionByLevel {
                     rank: l,
                     level: left.level,
-                    constraints: left.constraints,
                 }),
                 l,
             ),
@@ -198,7 +177,6 @@ impl<T> Union for UnionByLevel<T> {
                 UnionResult::Right(UnionByLevel {
                     rank: r,
                     level: left.level,
-                    constraints: left.constraints,
                 }),
                 r,
             ),
@@ -207,16 +185,10 @@ impl<T> Union for UnionByLevel<T> {
             Ordering::Less => UnionResult::Left(UnionByLevel {
                 rank: rank,
                 level: left.level,
-                constraints: match rank_result {
-                    UnionResult::Left(x) | UnionResult::Right(x) => x.constraints,
-                },
             }),
             Ordering::Greater => UnionResult::Right(UnionByLevel {
                 rank: rank,
                 level: right.level,
-                constraints: match rank_result {
-                    UnionResult::Left(x) | UnionResult::Right(x) => x.constraints,
-                },
             }),
             Ordering::Equal => rank_result,
         }
@@ -258,13 +230,13 @@ impl<T: Substitutable> Substitution<T> {
 
     pub fn insert(&self, var: u32, t: T) {
         match t.get_var() {
-            Some(_) => panic!(
+            Some(_) => ice!(
                 "Tried to insert variable which is not allowed as that would cause memory \
                  unsafety"
             ),
             None => match self.types.try_insert(var, t) {
                 Ok(()) => (),
-                Err(_) => panic!("Expected variable to not have a type associated with it"),
+                Err(_) => ice!("Expected variable to not have a type associated with it"),
             },
         }
     }
@@ -274,21 +246,22 @@ impl<T: Substitutable> Substitution<T> {
     where
         T: Clone,
     {
-        self.new_constrained_var(None)
+        self.new_var_fn(|var| T::from_variable(self.factory.new(var)))
     }
 
-    pub fn new_constrained_var(&self, constraint: Option<(Symbol, Constraints<T>)>) -> T
+    pub fn new_var_fn<F>(&self, f: F) -> T
     where
         T: Clone,
+        F: FnOnce(u32) -> T,
     {
         let var_id = self.variables.len() as u32;
         let id = self.union.borrow_mut().insert(UnionByLevel {
-            constraints: constraint.into_iter().collect(),
             ..UnionByLevel::default()
         });
         assert!(id == self.variables.len());
+        debug!("New var {}", self.variables.len());
 
-        let var = T::from_variable(self.factory.new(var_id));
+        let var = f(var_id);
         self.variables.push(var.clone());
         var
     }
@@ -306,12 +279,22 @@ impl<T: Substitutable> Substitution<T> {
         }
     }
 
+    pub fn get_var(&self, var: u32) -> Option<&T> {
+        self.variables.get(var as usize)
+    }
+
     pub fn find_type_for_var(&self, var: u32) -> Option<&T> {
-        let index = self.union.borrow_mut().find(var as usize) as u32;
-        self.types.get(&index).or_else(|| if var == index {
-            None
-        } else {
-            Some(&self.variables[index as usize])
+        let mut union = self.union.borrow_mut();
+        if var as usize >= union.size() {
+            return None;
+        }
+        let index = union.find(var as usize) as u32;
+        self.types.get(&index).or_else(|| {
+            if var == index {
+                None
+            } else {
+                Some(&self.variables[index as usize])
+            }
         })
     }
 
@@ -322,6 +305,11 @@ impl<T: Substitutable> Substitution<T> {
         union.get_mut(other as usize).level = level;
     }
 
+    pub fn set_level(&self, var: u32, level: u32) {
+        let mut union = self.union.borrow_mut();
+        union.get_mut(var as usize).level = level;
+    }
+
     pub fn get_level(&self, mut var: u32) -> u32 {
         if let Some(v) = self.find_type_for_var(var) {
             var = v.get_var().map_or(var, |v| v.get_id());
@@ -330,16 +318,6 @@ impl<T: Substitutable> Substitution<T> {
         let level = &mut union.get_mut(var as usize).level;
         *level = ::std::cmp::min(*level, var);
         *level
-    }
-
-    pub fn get_constraints(&self, var: u32) -> Option<RefMut<FnvMap<Symbol, Constraints<T>>>> {
-        let union = self.union.borrow_mut();
-        let set = RefMut::map(union, |x| &mut x.get_mut(var as usize).constraints);
-        if set.is_empty() {
-            None
-        } else {
-            Some(set)
-        }
     }
 
     pub fn replace_variable(&self, typ: &T) -> Option<T>
@@ -353,6 +331,13 @@ impl<T: Substitutable> Substitution<T> {
     }
 }
 
+pub fn is_variable_unified(subs: &Substitution<ArcType>, var: &ArcType) -> bool {
+    match **var {
+        Type::Variable(ref var) => subs.find_type_for_var(var.id).is_some(),
+        _ => unreachable!(),
+    }
+}
+
 impl Substitution<ArcType> {
     fn replace_variable_(&self, typ: &Type<Symbol>) -> Option<ArcType> {
         match *typ {
@@ -360,18 +345,53 @@ impl Substitution<ArcType> {
             _ => None,
         }
     }
+
     pub fn set_type(&self, t: ArcType) -> ArcType {
-        types::walk_move_type(t, &mut |typ| {
-            let replacement = self.replace_variable_(typ);
-            let result = {
-                let mut typ = typ;
-                if let Some(ref t) = replacement {
-                    typ = t;
-                }
-                unroll_typ(typ)
-            };
-            result.or(replacement)
-        })
+        self.set_type_(&t).unwrap_or(t)
+    }
+    fn set_type_(&self, typ: &ArcType) -> Option<ArcType> {
+        match **typ {
+            Type::Forall(ref params, ref typ, Some(ref vars)) => {
+                let subs = self;
+                let mut named_variables: FnvMap<_, _> = params
+                    .iter()
+                    .zip(vars)
+                    .filter(|&(_, var)| is_variable_unified(subs, var))
+                    .map(|(param, var)| (param.id.clone(), var.clone()))
+                    .collect();
+                let typ = typ.instantiate_generics(&mut named_variables);
+                self.set_type_(&typ).map(|typ| {
+                    if params.len() != named_variables.len() {
+                        let mut new_params = Vec::new();
+                        let mut new_vars = Vec::new();
+                        for (param, var) in params.iter().zip(vars) {
+                            if !is_variable_unified(subs, var) {
+                                new_params.push(param.clone());
+                                new_vars.push(var.clone());
+                            }
+                        }
+                        ArcType::from(Type::Forall(new_params, typ, Some(new_vars)))
+                    } else {
+                        typ
+                    }
+                })
+            }
+            Type::Variable(_) => {
+                let replacement = self.replace_variable_(typ);
+                let result = {
+                    let mut typ = typ;
+                    if let Some(ref t) = replacement {
+                        typ = t;
+                    }
+                    unroll_typ(typ)
+                };
+                result.or(replacement)
+            }
+            _ => types::walk_move_type_opt(
+                typ,
+                &mut types::ControlVisitation(|typ: &ArcType| self.set_type_(typ)),
+            ),
+        }
     }
 }
 
@@ -382,12 +402,13 @@ impl<T: Substitutable + Clone> Substitution<T> {
 }
 impl<T: Substitutable + PartialEq + Clone> Substitution<T> {
     /// Takes `id` and updates the substitution to say that it should have the same type as `typ`
-    pub fn union<P, S>(&self, state: P, id: &T::Variable, typ: &T) -> Result<Option<T>, Error<T>>
+    pub fn union(&self, id: &T::Variable, typ: &T) -> Result<Option<T>, Error<T>>
     where
         T::Variable: Clone,
-        T: Unifiable<S> + fmt::Display,
-        P: FnMut() -> S,
+        T: fmt::Display,
     {
+        let resolved_type = typ.on_union();
+        let typ = resolved_type.unwrap_or(typ);
         // Nothing needs to be done if both are the same variable already (also prevents the occurs
         // check from failing)
         if typ.get_var()
@@ -401,19 +422,14 @@ impl<T: Substitutable + PartialEq + Clone> Substitution<T> {
         {
             let id_type = self.find_type_for_var(id.get_id());
             let other_type = self.real(typ);
-            if id_type.map_or(false, |x| x == other_type) ||
-                other_type.get_var().map(|y| y.get_id()) == Some(id.get_id())
+            if id_type.map_or(false, |x| x == other_type)
+                || other_type.get_var().map(|y| y.get_id()) == Some(id.get_id())
             {
                 return Ok(None);
             }
         }
-        let resolved_type = if typ.get_var().is_none() {
-            self.resolve_constraints(state, id, typ)?
-        } else {
-            None
-        };
         {
-            let typ = resolved_type.as_ref().unwrap_or(typ);
+            let typ = resolved_type.unwrap_or(typ);
             match typ.get_var().map(|id| id.get_id()) {
                 Some(other_id) => {
                     self.union
@@ -427,164 +443,6 @@ impl<T: Substitutable + PartialEq + Clone> Substitution<T> {
                 }
             }
         }
-        Ok(resolved_type)
-    }
-
-    pub fn resolve_constraints<P, S>(
-        &self,
-        mut state: P,
-        id: &T::Variable,
-        typ: &T,
-    ) -> Result<Option<T>, Error<T>>
-    where
-        T::Variable: Clone,
-        T: Unifiable<S> + fmt::Display,
-        P: FnMut() -> S,
-    {
-        use std::borrow::Cow;
-
-        let constraints = self.union
-            .borrow_mut()
-            .get(id.get_id() as usize)
-            .constraints
-            .clone();
-
-        let mut typ = Cow::Borrowed(typ);
-        for (constraint_name, constraint) in &constraints {
-            debug!(
-                "Attempting to resolve {} to the constraints {}:\n{}",
-                typ,
-                constraint_name,
-                constraint.iter().format("\n")
-            );
-            let resolved = constraint
-                .iter()
-                .filter_map(|constraint_type| {
-                    let constraint_type = constraint_type.instantiate(self, &FnvMap::default());
-                    match equivalent(state(), self, &constraint_type, &typ) {
-                        Ok(()) => Some(constraint_type),
-                        Err(()) => None,
-                    }
-                })
-                .next();
-            match resolved {
-                None => {
-                    debug!("Unable to resolve {}", typ);
-                    return Err(Error::Constraint(typ.into_owned(), constraint.clone()));
-                }
-                Some(resolved) => {
-                    // Only replace the type if it is replaced by a lower level variable or a
-                    // concrete type
-                    match (
-                        typ.get_var().map(|x| x.get_id()),
-                        resolved.get_var().map(|x| x.get_id()),
-                    ) {
-                        (Some(x), Some(y)) if x > y => {
-                            typ = Cow::Owned(resolved);
-                        }
-                        (_, None) => {
-                            typ = Cow::Owned(resolved);
-                        }
-                        _ => (),
-                    }
-                }
-            }
-        }
-        if !constraints.is_empty() {
-            debug!("Resolved {}", typ);
-        }
-        Ok(match typ {
-            Cow::Borrowed(_) => None,
-            Cow::Owned(typ) => Some(typ),
-        })
-    }
-}
-
-use unify::{Error as UnifyError, Unifiable, Unifier, UnifierState};
-
-pub fn equivalent<S, T>(
-    state: S,
-    subs: &Substitution<T>,
-    actual: &T,
-    inferred: &T,
-) -> Result<(), ()>
-where
-    T: Unifiable<S> + PartialEq + Clone,
-    T::Variable: Clone,
-{
-    let mut unifier = UnifierState {
-        state,
-        unifier: Equivalent {
-            equiv: true,
-            subs,
-            temp_subs: FnvMap::default(),
-        },
-    };
-    unifier.try_match(actual, inferred);
-    if !unifier.unifier.equiv {
-        Err(())
-    } else {
-        Ok(())
-    }
-}
-
-struct Equivalent<'e, T: Substitutable + 'e> {
-    equiv: bool,
-    subs: &'e Substitution<T>,
-    temp_subs: FnvMap<u32, T>,
-}
-
-impl<'e, S, T> Unifier<S, T> for Equivalent<'e, T>
-where
-    T: Unifiable<S> + PartialEq + Clone + 'e,
-    T::Variable: Clone,
-{
-    fn report_error(unifier: &mut UnifierState<S, Self>, _error: UnifyError<T, T::Error>) {
-        unifier.unifier.equiv = false;
-    }
-
-    fn try_match_res(
-        unifier: &mut UnifierState<S, Self>,
-        l: &T,
-        r: &T,
-    ) -> Result<Option<T>, UnifyError<T, T::Error>> {
-        let (l, r) = {
-            use std::borrow::Cow;
-
-            let subs = unifier.unifier.subs;
-            let temp_subs = &mut unifier.unifier.temp_subs;
-
-            let l = subs.real(l);
-            let l = l.get_var()
-                .and_then(|l| temp_subs.get(&l.get_id()).cloned().map(Cow::Owned))
-                .unwrap_or(Cow::Borrowed(l));
-
-            let r = subs.real(r);
-            let r = r.get_var()
-                .and_then(|r| temp_subs.get(&r.get_id()).cloned().map(Cow::Owned))
-                .unwrap_or(Cow::Borrowed(r));
-
-            match (l.get_var(), r.get_var()) {
-                (Some(l), Some(r)) if l.get_id() == r.get_id() => return Ok(None),
-                (_, Some(r)) => {
-                    temp_subs.insert(r.get_id(), l.clone().into_owned());
-                    return Ok(None);
-                }
-                (Some(l), _) => {
-                    temp_subs.insert(l.get_id(), r.clone().into_owned());
-                    return Ok(None);
-                }
-                (_, _) => {}
-            }
-            (l, r)
-        };
-        // Both sides are concrete types, the only way they can be equal is if
-        // the matcher finds their top level to be equal (and their sub-terms
-        // unify)
-        l.zip_match(&r, unifier)
-    }
-
-    fn error_type(_unifier: &mut UnifierState<S, Self>) -> Option<T> {
-        None
+        Ok(resolved_type.cloned())
     }
 }

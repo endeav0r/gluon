@@ -1,4 +1,3 @@
-
 #[macro_use]
 extern crate collect_mac;
 extern crate env_logger;
@@ -14,8 +13,7 @@ use gluon::base::pos::Line;
 use gluon::base::types::{ArcType, Type};
 use gluon::{new_vm, Compiler};
 use gluon::vm::compiler::UpvarInfo;
-use gluon::vm::thread::{ThreadInternal, CALL_FLAG, LINE_FLAG};
-
+use gluon::vm::thread::{HookFlags, ThreadInternal};
 
 const SIMPLE_EXPR: &'static str = r#"
     let f x = x
@@ -26,7 +24,7 @@ const SIMPLE_EXPR: &'static str = r#"
 
 #[test]
 fn function_hook() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let functions = Arc::new(Mutex::new(Vec::new()));
@@ -44,7 +42,7 @@ fn function_hook() {
             );
             Ok(Async::Ready(()))
         })));
-        context.set_hook_mask(CALL_FLAG);
+        context.set_hook_mask(HookFlags::CALL_FLAG);
     }
     Compiler::new()
         .implicit_prelude(false)
@@ -62,7 +60,7 @@ fn run_line_hook_test(source: &str) -> Vec<Line> {
     {
         let mut context = thread.context();
         context.set_hook(Some(Box::new(move |_, _| Ok(Async::NotReady))));
-        context.set_hook_mask(LINE_FLAG);
+        context.set_hook_mask(HookFlags::LINE_FLAG);
     }
     let mut execute = Compiler::new()
         .implicit_prelude(false)
@@ -94,7 +92,7 @@ fn run_line_hook_test(source: &str) -> Vec<Line> {
 
 #[test]
 fn line_hook() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let lines = run_line_hook_test(SIMPLE_EXPR);
     assert_eq!(
@@ -108,7 +106,7 @@ fn line_hook() {
 
 #[test]
 fn line_hook_recursive_functions() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let expr = r#"
 let f x = x
@@ -128,13 +126,13 @@ and g y = f
 
 #[test]
 fn line_hook_after_call() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     {
         let mut context = thread.context();
         context.set_hook(Some(Box::new(move |_, _| Ok(Async::NotReady))));
-        context.set_hook_mask(LINE_FLAG);
+        context.set_hook_mask(HookFlags::LINE_FLAG);
     }
 
     let expr = r#"
@@ -173,21 +171,19 @@ fn line_hook_after_call() {
 
 #[test]
 fn implicit_prelude_lines_not_counted() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     {
         let mut context = thread.context();
-        context.set_hook(Some(Box::new(
-            move |_, debug_info| if debug_info.stack_info(0).unwrap().source_name() ==
-                "test"
-            {
+        context.set_hook(Some(Box::new(move |_, debug_info| {
+            if debug_info.stack_info(0).unwrap().source_name() == "test" {
                 Ok(Async::NotReady)
             } else {
                 Ok(Async::Ready(()))
-            },
-        )));
-        context.set_hook_mask(LINE_FLAG);
+            }
+        })));
+        context.set_hook_mask(HookFlags::LINE_FLAG);
     }
     let mut execute = Compiler::new()
         .run_expr_async::<i32>(&thread, "test", "1")
@@ -214,7 +210,7 @@ fn implicit_prelude_lines_not_counted() {
 
 #[test]
 fn read_variables() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let result = Arc::new(Mutex::new(BTreeMap::new()));
@@ -227,14 +223,12 @@ fn read_variables() {
                 stack_info.line().unwrap().to_usize(),
                 stack_info
                     .locals()
-                    .map(|local| {
-                        (local.name.declared_name().to_string(), local.typ.clone())
-                    })
+                    .map(|local| (local.name.declared_name().to_string(), local.typ.clone()))
                     .collect::<Vec<_>>(),
             );
             Ok(Async::Ready(()))
         })));
-        context.set_hook_mask(LINE_FLAG);
+        context.set_hook_mask(HookFlags::LINE_FLAG);
     }
     let expr = r#"
     let x = 1
@@ -292,7 +286,7 @@ fn read_variables() {
 
 #[test]
 fn argument_types() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let result = Arc::new(Mutex::new(Vec::new()));
@@ -305,14 +299,12 @@ fn argument_types() {
                 stack_info.line().unwrap().to_usize(),
                 stack_info
                     .locals()
-                    .map(|local| {
-                        (local.name.declared_name().to_string(), local.typ.clone())
-                    })
+                    .map(|local| (local.name.declared_name().to_string(), local.typ.clone()))
                     .collect::<Vec<_>>(),
             ));
             Ok(Async::Ready(()))
         })));
-        context.set_hook_mask(LINE_FLAG);
+        context.set_hook_mask(HookFlags::LINE_FLAG);
     }
     let expr = r#"
     let int_function x: Int -> Int = x
@@ -338,7 +330,7 @@ fn argument_types() {
                 vec![
                     ("int_function".to_string(), int_function.clone()),
                     ("g".to_string(), int_function.clone()),
-                ]
+                ],
             ),
             (
                 4,
@@ -346,7 +338,7 @@ fn argument_types() {
                     ("int_function".to_string(), int_function.clone()),
                     ("g".to_string(), int_function.clone()),
                     ("f".to_string(), int_function.clone()),
-                ]
+                ],
             ),
             (3, vec![("z".to_string(), Type::int())]),
             (2, vec![("y".to_string(), Type::int())]),
@@ -357,7 +349,7 @@ fn argument_types() {
 
 #[test]
 fn source_name() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let result = Arc::new(Mutex::new(String::new()));
@@ -369,7 +361,7 @@ fn source_name() {
             *result.lock().unwrap() = stack_info.source_name().to_string();
             Ok(Async::Ready(()))
         })));
-        context.set_hook_mask(LINE_FLAG);
+        context.set_hook_mask(HookFlags::LINE_FLAG);
     }
     let expr = r#"
     let x = 1
@@ -390,10 +382,9 @@ fn source_name() {
     assert_eq!(*name, "test");
 }
 
-
 #[test]
 fn upvars() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let result = Arc::new(Mutex::new(Vec::new()));
@@ -407,17 +398,18 @@ fn upvars() {
             }
             Ok(Async::Ready(()))
         })));
-        context.set_hook_mask(CALL_FLAG);
+        context.set_hook_mask(HookFlags::CALL_FLAG);
     }
     let expr = r#"
     let x = 1
     let y = 2
     let f z =
         let g w = x
-        g x + y + z
+        g x #Int+ y #Int+ z
     f 3
     "#;
     Compiler::new()
+        .implicit_prelude(false)
         .run_expr::<i32>(&thread, "test", expr)
         .unwrap();
 
@@ -429,10 +421,6 @@ fn upvars() {
                 UpvarInfo {
                     name: "x".to_string(),
                     typ: Type::int(),
-                },
-                UpvarInfo {
-                    name: "+".to_string(),
-                    typ: Type::function(vec![Type::int(), Type::int()], Type::int()),
                 },
                 UpvarInfo {
                     name: "y".to_string(),
@@ -451,7 +439,7 @@ fn upvars() {
 
 #[test]
 fn implicit_prelude_variable_names() {
-    let _ = env_logger::init();
+    let _ = env_logger::try_init();
 
     let thread = new_vm();
     let functions = Arc::new(Mutex::new(Vec::<ArcType>::new()));
@@ -468,7 +456,7 @@ fn implicit_prelude_variable_names() {
             );
             Ok(Async::Ready(()))
         })));
-        context.set_hook_mask(LINE_FLAG);
+        context.set_hook_mask(HookFlags::LINE_FLAG);
     }
     Compiler::new()
         .run_expr::<i32>(&thread, "test", "\n1")
@@ -476,9 +464,10 @@ fn implicit_prelude_variable_names() {
     let f = functions.lock().unwrap();
     match *f[0] {
         Type::Record(ref row) => {
-            assert!(row.row_iter().any(
-                |field| field.name.declared_name() == "id",
-            ));
+            assert!(
+                row.row_iter()
+                    .any(|field| field.name.declared_name() == "+")
+            );
         }
         _ => panic!(),
     }

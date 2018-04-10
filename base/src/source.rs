@@ -57,12 +57,10 @@ impl Lines {
         if byte.to_usize() <= self.end {
             let line_index = self.line_number_at_byte(byte);
 
-            self.line(line_index).map(|line_byte| {
-                Location {
-                    line: line_index,
-                    column: Column::from((byte - line_byte).to_usize()),
-                    absolute: byte,
-                }
+            self.line(line_index).map(|line_byte| Location {
+                line: line_index,
+                column: Column::from((byte - line_byte).to_usize()),
+                absolute: byte,
             })
         } else {
             None
@@ -93,15 +91,20 @@ pub struct Source<'a> {
 
 impl<'a> Source<'a> {
     pub fn new(src: &str) -> Source {
-        Source {
-            src: src,
-            lines: Lines::new(src.as_bytes().iter().cloned()),
-        }
+        Source::with_lines(src, Lines::new(src.as_bytes().iter().cloned()))
+    }
+
+    pub fn with_lines(src: &str, lines: Lines) -> Source {
+        Source { src, lines }
     }
 
     /// Returns the string which defines the source
     pub fn src(&self) -> &'a str {
         self.src
+    }
+
+    pub fn lines(&self) -> &Lines {
+        &self.lines
     }
 
     /// Returns the byte offset and source of `line_number`
